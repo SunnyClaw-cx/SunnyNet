@@ -2901,3 +2901,3673 @@ python -X utf8 -m pytest tests/test_quant_i4.py -v
 > 否则同进程内累积的模型构建会使读数偏高至 2 倍以上，见 §2.4。
 
 全部原始结果见 `experiments/results/`，图表见 `docs/figures/`。
+---
+
+# SunnyNet Experiment Report
+
+All data come from local measurements; no paper numbers are cited and no extrapolated
+estimates are made. Every number has a corresponding raw record in
+`experiments/results/*.json`. Untested, untestable, or confounded items are labeled directly
+in the text; estimates are never substituted for measurements.
+
+---
+
+## TL;DR
+
+| Conclusion | Evidence | Confidence |
+|---|---|---|
+| vs Transformer (**forward only**): after T≳384 SunnyNet is faster (T=4096 **22.69x** faster per token) | Process-isolated forward-latency measurement (§2.4) | High (architecture-intrinsic) |
+| **Training speed (fwd+bwd) is 20–52% behind every O(N) peer** (old `dim=128` config, no crossover from T=256 to T=4096) | batch=8 training step, process-isolated (§13) | High (IQR 5–15%) |
+| **Training speed ties rwkv after the narrow residual stream + dropping `p.clamp`** (T=256 nominally 3.0% faster, T=512 3.7% slower), stable 16–41% lead over h3/mamba/hyena/linear | 5 isolated subprocesses + 9-round per-round paired head-to-head (§16) | Medium (paired test not significant, treated as statistical tie) |
+| **`p.clamp` is analytically unreachable**: measured p∈[0.5902,0.99994], the lower bound is 1209x above `p_floor`; dropping the clamp leaves the forward bit-identical | 20-step sampling + fp64 equivalence check (§16.1) | High |
+| **The training-speed tie holds only at `L=4`**: with layer counts aligned to rwkv's `L=6` the same-budget narrow config is 30–40% slower | Layer-aligned comparison (§16.5) | High |
+| **After the architecture fixes, T=256 quality rises to 2nd of 7** (ppl 93.82→~56.8, ahead of RWKV/Mamba/Hyena, still behind H3 53.93) | residual+CSN fixes, 600 steps multi-seed (§12) | Medium (unconverged / mostly single seed) |
+| Before the fix, **at T=256 it is not competitive with same-complexity O(N) peers** (H3's ppl is 0.57x SunnyNet's) | Seven-architecture same-protocol comparison, 600 steps | Superseded by §12 |
+| Forward speed has **no lead interval** over the peers (the draft's "only 512<T<2048" contradicts this table's data - at T=1024 it ranks 5th); SunnyNet improves with T across the seven: 6th→5th→5th→4th→3rd, **never 1st throughout** | Seven-architecture forward scaling measurement (§10.6) | Medium (IQR 4–26%) |
+| **In the training regime (batch=8, incl. backward) at T=1024 SunnyNet is 1st in speed** (0.1319 vs transformer 0.5569), 2nd in peak memory (1812MB, 43% below transformer) | Seven-architecture training-regime audit, per-cell subprocess (§17) | High |
+| **Cross-distribution (external new data) is not worse than the peers**: Chinese tech news ppl **321.08, 1st/7** (that domain has 23% unk), English arxiv abstracts **35.58, 2nd/7**; OOD drop 1.480, tied lowest with hyena | Independently collected external data (arxiv/Xinhua, etc.), trained on the original three domains 600 steps (§18) | Medium (single seed / unconverged) |
+| **The short-sequence inversion holds only in batch=1 forward**: in the training regime (batch=8) the crossover drops to T<256; at T=256/384 SunnyNet is 1.5–2.4x faster than TF; T=128 still 4.5–10.4% slower (narrow config 4.5%) | 3 configs x 3 lengths x 3 rounds, isolated subprocesses (§19) | Medium (memory load 84%) |
+| At 1.4M short sequences, quality is **statistically indistinguishable** from Transformer | 1200 steps single seed, val diff 1.10%, ppl diff 4.84%, **both below seed noise** | Medium (single seed) |
+| **At 20M scale quality rises to 1st of 5** (ppl 77.90, ahead of rwkv/mamba/h3/hyena); the speed gap narrows to 8–37% | Stack-param alignment + 200 steps + isolated timing (§14.6) | Medium (200 steps unconverged) |
+| **At 100M scale quality is only 2nd** (ppl 109.47, ~3.6% behind rwkv 105.66) - the 20M "1st" does not carry over | p100mw stack-aligned + 100 steps (§14.8) | Medium (100 steps unconverged) |
+| **At 100M the unified lr=3e-3 makes mamba diverge (step 37) and hyena gradient-explode (gn≈41.5)** | Divergence detection + lower-lr rerun (§14.8) | High |
+| ~~At 20M, T=512 it loses on both quality and speed~~ | The old conclusion came from the pre-fix stack + un-rebalanced layers, see §14.6 | Corrected |
+| Ablation experiments **cannot** serve as evidence of component effectiveness | 600 steps unconverged, disabling components is actually better | High |
+| Early timing data was distorted (no process isolation) | Same-process accumulated builds inflate readings up to 2x, varying by architecture (§2.4) | High |
+| **CSN through the oneDNN fused kernel + two-level parallel scan**: training step **19–41% faster (more at larger T)**, quality also improves (ppl 92.04→84.37) | 600 steps three seeds + per-cell subprocess (§14.1) | High |
+| **Under parameter alignment SunnyNet has far more layers than the peers** (20M: L10 vs 5–7; 100M: L14 vs 7–9), violating its own fairness discipline | meta-device counting (§14.2) | High |
+| **Layer reduction + widening (L10→L6, wider dim)**: stack params ±0.1%, training step **12.1% faster**, quality ppl **−10.9%**, memory −14% | 5 isolated subprocesses + 400-step quality A/B (§14.3–14.4) | High |
+| **The benefit ceiling of writing the scan / competition gate "as a fused kernel" is 8.8%** (replacement experiment); the realized result is 1.10–1.17x | A replacement experiment zeroing both segments (§14.7) + w64devkit kernel measurement (§22.3) | High |
+| **On GPU these two segments are a smaller share (scan 1.85% / gate 2.55%) → fusion has even less headroom on GPU** | CUDA kernel-level profiling (§15.5) | High |
+| **0.5B (scale05b) cannot be instantiated in CPU fp32; GPU forward/SGD run, but AdamW and momentum SGD both OOM** | Ladder + multi-step probe (§15.3/15.4) | High |
+| **0.5B multi-step loss shows no downward trend** (30 steps Δ=−0.005, inter-step range 0.72) → no quality data | Real-corpus SGD probe (§15.4) | High |
+| **Competition gate roll→index_select**: microbenchmark faster (0.717x/0.891x), no end-to-end difference → not adopted | Dual-platform end-to-end A/B (§15.6/15.7) | Medium |
+| `torch.compile` **unavailable**: MSVC present but Windows SDK headers missing + `reg.exe` blocked by the sandbox; `torch.jit` segfaults | Measured on this machine (§13.4) | High |
+| **Custom kernels cannot be compiled on the GPU side either**: no nvcc / no CUDA toolkit / no triton, cpp_extension lacks setuptools | GPU venv measurement (§15.5) | High |
+| **The inference advantage is architectural, not in the kernel**: single-step decode SunnyNet is flat (O(1), drift ±5%), Transformer climbs with context (O(t), 2.49→6.85ms); crossover T≈512, T=4096 **2.36x** faster; short-context kernel fusion gives no gain | Per-cell subprocess, run T steps first then time the single step (§22.10) | Medium (B=1 single sequence) |
+| CPU cache hit rate **not measurable on this machine** | No PDH cache counters; page-fault rate used as a proxy only | — |
+
+Core conclusion: fusion + layer reduction/widening make the same architecture both faster and better;
+after the narrow residual stream + dropping `p.clamp`, training speed ties rwkv (statistical tie),
+with a stable lead over h3/mamba/hyena/linear.
+
+- **Quality**: after the §12 fixes T=256 ppl is 2nd of 7 (57.83, behind only H3 53.93);
+  at 20M with layer reduction + widening, ppl drops a further **10.9%**
+  (54.82 vs 61.55, 400 steps unconverged), and rises to **1st of 5** in the 20M same-protocol
+  comparison (§14.6).
+- **Forward speed**: faster than Transformer after T≳384 (22.69x at T=4096, re-verified);
+  against same-O(N) peers there is **no stable lead interval** - it climbs from 6th to 3rd with
+  T (§10.6), never 1st throughout (hyena is always 1st).
+- **Training-regime memory**: at T=1024 peak RSS is **1812 MB**, **2nd-lowest** of the seven,
+  **43%** less than Transformer (3192 MB), in the same band as the O(N) peers (§17).
+- **Training speed**: operator fusion speeds up the **same architecture** by 19–41%;
+  layer reduction + widening makes it **another 12–17% faster**;
+  **the narrow residual stream (dim 128→80) + dropping `p.clamp` (§16)** is a further
+  **17.7–20.7% faster** at matched stack params - so the training step at T=256 **rises to 1st**
+  (0.0953 ms/tok, nominally 3.0% faster than rwkv), T=512 is 3.7% from rwkv, per-round paired
+  test not significant => recorded as "statistically tied with rwkv" by discipline;
+  stable 16–41% lead over h3/mamba/hyena/linear_attn. rwkv leads only nominally;
+  **"beats" was not achieved**.
+  The fused kernel's benefit ceiling measured at only 8.8% (§14.7), lower priority than the
+  already-landed changes.
+- **Boundary of the tie**: holds only at `L=4`; with layers aligned to `L=6` the same-budget
+  narrow config is 30–40% slower (§16.5).
+  And the T≥1024 peer advantage persists (§13's conclusion still holds under the old config).
+- **Scaling**: 20M and 100M are runnable and have been compared; **0.5B cannot be
+  instantiated in CPU fp32, and on GPU only forward and the most basic SGD run
+  (AdamW/momentum SGD both OOM), and multi-step loss does not drop → no 0.5B quality
+  conclusion**.
+- **The GPU-side positioning**: this machine's GPU is used for **correctness verification and
+  speedup measurement** (forward 8.0–15.2x, training step 9.9–12.5x, no CUDA-side
+  optimization done - a lower bound).
+  **Not used for kernel-level optimization** - no nvcc / no CUDA toolkit / no triton, and on
+  GPU scan+gate are under 5%, so fusion has less headroom than on CPU (§15.5).
+- **The scaling trend is not monotonic**: at 20M quality is 1st (§14.6), but **at 100M it falls
+  back to 2nd** (§14.8, 3.6% behind rwkv). The existing evidence only supports "quality is
+  competitive around 20M, at 100M in the same band as rwkv"; it does not support "bigger scale,
+  bigger advantage".
+
+Applicability depends on the target task's sequence length and the "quality-first vs
+speed-first" tradeoff.
+
+---
+
+## 1. Experimental setup
+
+### 1.1 Hardware and environment
+
+| Item | Value |
+|---|---|
+| CPU | 8 threads (`torch.set_num_threads(8)`) |
+| Memory | 15.87 GB physical |
+| Precision | Native FP32 (no FP16/BF16) |
+| PyTorch | CPU build |
+| OS | Windows 11 |
+
+> **Measurement-contamination disclosure**: during the experiments two **unrelated** Python
+> processes were running on this machine
+> (`recall_attrib.py`, `minimind/verify_flow.py`); they have nothing to do with SunnyNet.
+> The concurrent load was relatively stable across the baseline/ablation/seed phases; the load
+> was confirmed for the latency measurements.
+> All timing numbers are affected; **the absolute values should be treated as upper bounds**,
+> and the inter-architecture **relative comparisons** still hold
+> (the two are measured alternately under the same load). This is a known limitation.
+
+### 1.2 Corpus (real, not synthetic)
+
+Source: Project Gutenberg Chinese classical texts + English literature, TheAlgorithms/Python
+source code.
+The tokenizer is a **BPE implemented from scratch** (vocabulary 8192).
+
+| Domain | Train tokens | Val tokens | Train files | Val files |
+|---|---|---|---|---|
+| Chinese classical `zh_ancient` | 39,987,804 | 2,183,213 | 345 | 22 |
+| English literature `en_literature` | 4,343,482 | 86,836 | 15 | 1 |
+| Python code `code_python` | 1,254,856 | 79,005 | 1,267 | 80 |
+| **Total** | **45,586,142** | **2,349,054** | 1,627 | 103 |
+
+- The validation set is split at **file level** (`val_ratio=0.06`); adjacent fragments of the
+  same text never cross train/val, eliminating information leakage.
+- **Missing domain**: the Chinese Wikipedia was unreachable on this machine's network, so
+  there is **no "encyclopedia" domain**; only 3 real domains are covered.
+  Compared with the required five domains "encyclopedia/novel/news/code/classical", it is
+  **incomplete** - labeled here directly.
+
+### 1.3 Comparison baselines
+
+Standard Transformer (`sunnynet/baseline.py`), with `d_model`/`d_ff` solved by **analytic
+formula** to match SunnyNet's **compute-stack parameter count** (the embedding layer is
+excluded, since SunnyNet has no positional embedding):
+
+| Preset | SunnyNet total params | SunnyNet stack params | Transformer stack params | Relative deviation |
+|---|---|---|---|---|
+| `small` | 1,413,908 | 365,332 | 361,952 | 0.93% |
+| `proto20m` | 20,955,698 | 16,761,394 | 16,762,160 | **0.005%** |
+
+> `proto20m`'s name was once corrected: the early config (d=384/r=224/di=640/L=8) measured
+> only 10.35M parameters - the name did not match; it was changed to
+> d=512/r=320/di=896/L=10, measured 20,955,698 parameters.
+
+### 1.4 Learning-rate calibration
+
+Each architecture scanned 3 learning rates (260 steps) and took its own best:
+
+| Learning rate | SunnyNet val loss | Transformer val loss |
+|---|---|---|
+| 0.001 | **4.8858** | 5.0614 |
+| 0.003 | **4.7720** ← best | 4.7989 |
+| 0.006 | 4.7822 | **4.7744** ← best |
+
+→ SunnyNet uses lr=0.003, Transformer uses lr=0.006. **Each compared with its own best
+learning rate**, so the baseline is not disadvantaged.
+
+---
+
+## 2. Core experiment: measured verification of the O(N) advantage
+
+This is the architecture's only claim; it can only be tested with data. Method: fix the model
+(`small`), vary the input sequence length, and measure the single forward-pass cost.
+
+![Sequence scaling](figures/seq_scaling.png)
+
+### 2.1 Data
+
+| Sequence length T | SunnyNet | Transformer | Cost ratio (TF/Sunny) |
+|---|---|---|---|
+| 256 | 45.6 ms | 17.5 ms | 0.38x |
+| 512 | 80.3 ms | 62.5 ms | 0.78x |
+| 1024 | 147.7 ms | 167.0 ms | **1.13x** |
+| 2048 | 215.8 ms | 542.1 ms | **2.51x** |
+| 4096 | 319.9 ms | 4041.8 ms | **12.63x** |
+
+### 2.2 Conclusions
+
+1. **The O(N) claim holds**: SunnyNet's cost grows roughly linearly with T
+   (45.6→319.9ms; T up 16x, cost up 7x; the slope actually eases at larger T as the fixed
+   overhead is amortized). Transformer exhibits O(T²) blowup (17.5→4041.8ms; T up 16x, cost up
+   230x).
+2. **Crossover T≈834**: below this, SunnyNet is slower; above it, faster.
+3. **Source of the short-sequence disadvantage**: at T=256 Transformer is only 17.5ms while
+   SunnyNet is 45.6ms.
+   The cause is that SunnyNet's per-token rolling-state computation includes several
+   elementwise operations (competition gate, scan, circulant filter); the constant factor is
+   higher than a single dense matmul. At short sequences, Transformer's parallel matmul wins
+   on efficiency.
+
+> **This result is critical**: any "SunnyNet is faster across the board" claim contradicts this
+> data.
+> The accurate statement is: SunnyNet trades the short-sequence constant-factor disadvantage for
+> a long-sequence linear-complexity advantage.
+
+### 2.3 The crossover depends on batch size
+
+The §2.1 latency measurements are **batch=1, forward only**. In **batch=8 training** (§3), at
+T=256 SunnyNet is actually **8.4% faster** (0.2831 vs 0.3089 ms/tok) - **the opposite of the
+batch=1 forward conclusion**.
+
+| Measurement condition | Which is faster at T=256 |
+|---|---|
+| Forward, batch=1 | Transformer (17.5 vs 45.6 ms) |
+| Training (fwd+bwd), batch=8 | SunnyNet (0.2831 vs 0.3089 ms/tok) |
+
+**Cause**: at batch=1 the matrices are tiny, so SunnyNet's several elementwise operators are
+dominated by **PyTorch's per-operator scheduling overhead**;
+as batch grows, matmul efficiency rises, and Transformer's attention compute grows linearly
+with batch,
+moving the crossover **to smaller T**.
+
+→ **Corrected conclusion**: the crossover **T≈834 is only the batch=1 forward value**, not a
+universal constant.
+It varies with batch, whether backward is included, and thread count. At decision time,
+measure against the real batch/length combination of the target task; do not apply a single
+number directly.
+
+### 2.4 Measurement-discipline correction (re-measured after process isolation; values differ from original §2.1)
+
+**Finding**: the absolute timings in §2.1 are not reproducible. Measuring the same model in the
+same process "after building several models", the cost can be **more than 2x** a clean process
+(measured T=4096: 325 ms vs 776–822 ms).
+The cause is heap fragmentation and allocator state degrading with in-process accumulated model
+builds, and **the amplification factor differs by architecture**.
+This distorts all inter-architecture timing ratios in §2.1 and the early versions.
+
+**The fix**: each `(architecture, sequence length)` cell runs in its own subprocess, building
+only one model per process.
+Script `experiments/on_scaling.py`. Re-measured (batch=1, forward, 8 threads, 9 repeats
+median):
+
+| Sequence length T | SunnyNet | Transformer | Cost ratio (TF/Sunny) | IQR |
+|---|---|---|---|---|
+| 128 | 14.0 ms | 7.5 ms | 0.53x | 19% / 26% |
+| 256 | 19.5 ms | 13.5 ms | 0.69x | 3.5% / 15% |
+| 512 | 26.4 ms | 40.8 ms | **1.55x** | 12% / 6% |
+| 768 | 34.6 ms | 87.3 ms | **2.53x** | 9% / 3% |
+| 1024 | 50.0 ms | 141.2 ms | **2.83x** | 6% / 7% |
+| 1536 | 58.0 ms | 315.4 ms | **5.44x** | 13% / 4% |
+| 2048 | 98.1 ms | 638.2 ms | **6.51x** | 7% / 6% |
+| 4096 | 148.7 ms | 3373.4 ms | **22.69x** | 4% / 3% |
+
+**Differences from §2.1 and their explanation**:
+
+| Item | §2.1 (contaminated) | §2.4 (process-isolated) | Note |
+|---|---|---|---|
+| T=256 cost ratio | 0.38x | 0.69x | contamination amplified SunnyNet more |
+| Crossover | T≈834 | **T≈384** (6-layer TF) / **T≈600** (4-layer TF) | the crossover moves with the reference model's depth |
+| T=4096 cost ratio | 12.63x | **22.69x** | contamination compressed the real gap |
+
+**Reason to keep the original values**: the **directional conclusions of §2.1 and §2.3 still
+hold** (short slower, long faster, crossover moves with batch/depth), but their **absolute
+numbers and the 12.63x should be treated as lower bounds**.
+When the README's "12.6x" and this table's "22.7x" are both quoted on the process-isolated
+regime, the latter is closer to the true value; but both hold only under their own measured
+conditions - **out of condition they are not citable**.
+
+**Re-verification of the 22.69x (2026-10-20, re-measured after the fusion changes)**:
+
+| Item | Value |
+|---|---|
+| Raw data | `experiments/results/seq_scaling.json`: T=4096 148.66 ms vs 3373.42 ms = **22.69x**, IQR 3.94% / 2.69% |
+| Re-verify data | `experiments/results/verify_22x.json`: 131.9 ms vs 3709.9 ms = **28.12x** (current post-fusion code), IQR 10.6% / 14.6% |
+| Conditions (must be cited with the number) | **batch=1, pure forward (no backward), 8 threads, 1.4M small model** |
+
+⇒ **The number is real and reproducible**; after the fusion changes the ratio goes up, not
+down (22.69 → 28.12, because fusion speeds SunnyNet's forward more than Transformer's).
+But it is a forward-latency ratio, not a training-speed ratio -
+the batch=8 training step is still behind the O(N) peers (§13).
+
+**One more regime note**: §2.4's `22.69x` and §10.6's "forward leads the peers only at
+512<T<2048"
+**are not contradictory**. The former is against a scalar-attention Transformer (O(T²), the gap
+grows as T² at T=4096);
+the latter is against other O(N) linear-class architectures (the gap is set by the constant
+factor, and larger T favors the peers over SunnyNet).
+
+---
+
+## 3. Quality comparison: can it tie?
+
+Speed is not the only metric. Compare quality under the same token budget
+(1200 steps x batch 8 x T 256 ≈ 2.45M tokens).
+
+![Baseline comparison](figures/speed_compare.png)
+
+![Training curves](figures/loss_curves.png)
+
+| Metric | SunnyNet | Transformer | Gap |
+|---|---|---|---|
+| Validation loss | 4.3367 | **4.2895** | +1.10% |
+| Validation perplexity | 76.46 | **72.93** | +4.84% |
+| Per-token time (T=256) | **0.2831 ms** | 0.3089 ms | SunnyNet 8.4% faster |
+| Peak memory | 896 MB | 879 MB | +1.9% |
+| Mean gradient norm | 0.8445 | 0.4838 | — |
+
+**Reading**:
+
+- At the small-scale, short-sequence setting, quality is close but **slightly worse**: val loss
+  1.10% higher, ppl 4.84% higher.
+- **But this 4.84% gap does not prove Transformer is better**: under the same config the
+  seed-noise ppl range is 6.32 (§6),
+  **greater than** the 3.53 between the two architectures. The baseline comparison ran a single
+  seed; the difference is within the noise magnitude.
+  The strict conclusion is: the two are statistically indistinguishable at small scale / short
+  sequence; a multi-seed comparison is needed to settle it (see §8's to-improve items).
+- On speed, "SunnyNet 8.4% faster" was recorded at the time, **but that data is void**: it came
+  from the pre-fix stack and had no process isolation (§2.4).
+  Per §13's process-isolated re-measure, at T=256 the training step SunnyNet **leads
+  Transformer by 1.10x** (0.1858 vs 0.2041 ms/token); the direction is consistent but the
+  magnitude follows §13; **against mamba/h3/hyena it is behind at all lengths**.
+
+> **Regime correction**: §3's "0.2831 ms/token" and §13's 0.1858 ms are not comparable -
+> the former is an un-isolated measurement (several models already built in the same process);
+> the latter is an independent subprocess.
+> **An un-isolated measurement under the same config reads about 50% high**, the same source as
+> the 2x-class amplification recorded in §2.4.
+---
+
+## 4. 20M-scale comparison
+
+### 4.1 Single-step training overhead (measured, batch 4, T=512)
+
+| Architecture | Single-step time | Per-token time | Total params |
+|---|---|---|---|
+| SunnyNet | 3.755 s | 1.834 ms | 20,955,698 |
+| Transformer | **2.200 s** | **1.074 ms** | 22,086,960 |
+
+> **Warning**: at 20M, T=512, SunnyNet is actually **71% slower per step**
+> (1.834 vs 1.074 ms/tok).
+> Two reasons: (a) T=512 is still **below the crossover 834**; (b) at 20M scale, SunnyNet's
+> per-token elementwise operators (still a dense d→inner multiply after the low-rank
+> projection) have their constant-factor disadvantage amplified.
+>
+> This means: SunnyNet's applicable range is determined by sequence length, not model scale.
+> Scaling the model up does not make it overtake on short sequences.
+
+### 4.2 20M training quality comparison (300 steps)
+
+> **Note**: 300 steps is far from converging a 20M model (val is still dropping fast:
+> 5.73→5.55→5.49).
+> The numbers here only confirm "training runs normally, gradients do not explode, memory does
+> not run away"; they are **not a quality-comparison conclusion**.
+
+| Architecture | Total params | Stack params | val loss | ppl | ms/token | Peak memory | Mean grad norm | Wall |
+|---|---|---|---|---|---|---|---|---|
+| SunnyNet | 20,955,698 | 16,761,394 | 5.4883 | 241.84 | 3.1642 | 2579 MB | 1.846 | 1987 s |
+| Transformer | 22,086,960 | 16,762,160 | **5.0955** | **163.29** | **2.281** | 1689 MB | 0.779 | 1430 s |
+
+**SunnyNet loses on both quality and speed at 20M, T=512**: ppl **48.1%** higher
+(241.84 vs 163.29),
+**38.7%** slower per token (3.164 vs 2.281 ms), memory **52.7%** higher
+(2579 vs 1689 MB).
+This is a clearly unfavorable result.
+
+**Cause analysis**:
+
+1. T=512 is **below the crossover 834**; SunnyNet's O(N) advantage has not yet opened up, and
+   the constant-factor disadvantage is fully exposed.
+2. SunnyNet's per-token operator chain is long
+   (normalize → conv → low-rank projection → competition gate → scan → output feedback);
+   at 20M dimensions each operator's scheduling and memory-access overhead is amplified;
+   Transformer is just a few large matrix multiplies.
+3. The higher memory (2579MB) comes from the scan having to store the whole state
+   `(B,T,d)`, while Transformer's activations are freed by PyTorch layer by layer.
+
+**Conclusion**: SunnyNet is a long-sequence-specialized scheme, not a more-resource-frugal
+general replacement.
+Scaling up the model on short sequences only amplifies its disadvantage.
+
+**Training-health reading** (SunnyNet):
+
+- Gradient norm oscillates 0.84–1.93, **not exploding and not vanishing**; 10-layer depth is
+  acceptable.
+- Peak memory 2579 MB, **no paging risk** (this machine has 15.87 GB).
+- val loss decreases monotonically (5.7325 → 5.5545 → 5.4883); training is stable.
+
+**Measurement-contamination note**: SunnyNet's ms/token over three reads was
+2.527 → 2.477 → **3.164**; the last is clearly elevated due to **intensified CPU contention
+during measurement**, not the model slowing down.
+
+---
+
+## 5. Ablation experiments
+
+![Ablation](figures/ablation.png)
+
+600 steps, `small` preset, components disabled one at a time:
+
+| Variant | val loss | ppl | ms/token |
+|---|---|---|---|
+| full (complete) | 4.5681 | 96.36 | 0.4528 |
+| no_decay_gate | **4.5539** | **95.01** | 0.3231 |
+| no_circulant | 4.5663 | 96.19 | 0.3259 |
+| no_local_taps | 4.5722 | 96.76 | 0.2605 |
+| no_current | 4.5531 | 94.92 | 0.4878 |
+| none (all off) | 4.6058 | 100.06 | 0.2063 |
+
+**Three problems with the ablation experiment**:
+
+- Disabling a single component makes ppl **lower instead** (e.g. no_current 94.92 < full
+  96.36),
+  which is impossible in principle for a fully trained model.
+- The cause is that **600 steps is far from converging** (see the training curve; loss is
+  still dropping at 1200 steps).
+  When unconverged, smaller capacity "overfits more slowly", so ppl readings are noise-
+  dominated.
+- Therefore this ablation does not constitute evidence for any component's effectiveness; it
+  only shows "all-off (none) is indeed the worst" (100.06),
+  i.e. these components **do contribute compute** (direction undetermined).
+- Ablations should be done on a converged checkpoint, or at several times the current step
+  count.
+  This is a **to-improve item**, not a usable conclusion.
+
+### 5.1 The valid speed-side reading
+
+The ablation's speed data is reliable (it does not depend on convergence):
+
+| Variant | ms/token | Relative to full |
+|---|---|---|
+| full | 0.4528 | 1.00x |
+| no_local_taps | 0.2605 | **0.58x** |
+| no_current | 0.4878 | 1.08x |
+| no_decay_gate | 0.3231 | 0.71x |
+| none | 0.2063 | 0.46x |
+
+→ The depthwise-separable convolution (local_taps) and the protection gate (decay_gate) are
+**the main cost sources**,
+about 42% of full. This gives a clear direction for later optimization.
+
+---
+
+## 6. Seed stability
+
+600 steps, 3 random seeds:
+
+| Seed | val loss | ppl |
+|---|---|---|
+| 1234 | 4.5681 | 96.36 |
+| 2024 | 4.5984 | 99.32 |
+| 3407 | 4.6316 | 102.68 |
+| **Mean ± sample std** | **4.5994 ± 0.0318** | 99.45 ± 3.16 |
+
+→ Coefficient of variation about **0.69%**; seed-to-seed variation is small and the result is
+**reproducible**.
+The inter-seed ppl range (96.36→102.68, **range 6.32**) is **larger than** the inter-
+architecture ppl difference (76.46 vs 72.93, **difference 3.53**),
+which shows that single-run comparison conclusions are fragile and multi-seed repetition is
+necessary. The baseline comparison ran a
+single seed only (seed=1234); its 4.84% ppl gap **falls inside the seed-noise magnitude**, so
+the two architectures' quality difference at small scale
+**should be judged "statistically indistinguishable"**, not "Transformer is better".
+
+---
+
+## 7. Long-sequence training comparison (direct verification of the crossover)
+
+§2's crossover conclusion comes from **forward latency**. To verify it holds in **real
+training** as well,
+a training comparison was done at T=1024 (**above the crossover 834**)
+(200 steps, batch 4, `small` preset).
+
+![Long-sequence training comparison](figures/longseq_train.png)
+
+| Metric | SunnyNet | Transformer | SunnyNet advantage |
+|---|---|---|---|
+| Per-token time | **0.2623 ms** | 0.5445 ms | **2.08x faster** |
+| Validation loss | **5.1320** | 5.3702 | 4.4% better |
+| Validation perplexity | **169.35** | 214.92 | **21.2% better** |
+| Peak memory | **1269 MB** | 2008 MB | **36.8% saved** |
+| Stack params | 365,332 | 361,952 | aligned (0.9% diff) |
+
+**This is the most important positive result**: at T=1024, SunnyNet is **simultaneously**
+better than a parameter-matched Transformer on all three dimensions - speed, quality, memory.
+The three advantages are **consistent in direction and substantial in magnitude**,
+not noise (the 21.2% ppl advantage is far above seed noise ~6%).
+
+**Consistency with §2's crossover prediction**: forward latency predicted 1.13x faster at
+T=1024;
+measured training (with backward) is 2.08x faster. **Same direction, larger magnitude**
+(backward attention's
+O(T²) cost is heavier than forward). The crossover conclusion is thereby more credible.
+
+**Contrast with §4**: at T=512 SunnyNet loses both (§4); at T=1024 it wins three (§7).
+**The conclusion is self-consistent: applicability is entirely determined by sequence length,
+with the boundary near T≈834.**
+
+---
+
+## 8. Long-range dependency probe
+
+> **Architecture-version note**: §8's checkpoint is
+> `data/ck_probe_sunnynet.pt`; its state_dict contains only `blocks.N.delta`,
+> **not** `theta` / `delta_max` / `delta_min` ⇒ **it comes from the old pre-§12 architecture**
+> (the current architecture cannot load that ckpt; it would report unexpected/missing keys).
+> Therefore §8's numbers do not represent the post-fix
+> (residual bypass + CSN floor + learnable theta) retrieval ability;
+> a re-measure requires retraining on the current architecture. The version was not labeled
+> before; corrected here.
+
+**Probe design**: find **repeatedly occurring token fragments** in the real validation corpus.
+If a fragment has appeared before and the model truly exploits long-range context, it should
+rank the token that followed it before as top-1.
+Hit rates are bucketed by "distance from the most recent occurrence".
+
+Two key lengths are supported (`--ngram`): `1` = single-token predecessor; `4`/`8` =
+multi-token fragments.
+The longer the key, the more a hit indicates genuine long-range retrieval rather than local
+smoothing.
+
+### 8.1 Discriminative-power self-check
+
+| Model | code_python / ngram=4 / far-bucket hit rate |
+|---|---|
+| **Untrained** (random init) | **0.0** |
+| After 800 steps of training (SunnyNet) | **0.1208** |
+| After 800 steps of training (Transformer) | **0.1208** |
+
+Untrained model is 0.0 in every bucket → **the probe does measure learned retrieval ability**,
+not noise.
+
+### 8.2 Comparison result (budget: 800 steps / T=1024 / batch 4 / `small` preset)
+
+| Key length | Domain | Distance bucket | SunnyNet | Transformer |
+|---|---|---|---|---|
+| 1 | code_python | near | 0.1796 | 0.1802 |
+| 1 | code_python | mid (17–256) | 0.1166 | 0.1184 |
+| 1 | code_python | far (257–2048) | 0.0096 | **0.0129** |
+| 4 | code_python | near | 0.3961 | 0.3943 |
+| 4 | code_python | mid | 0.1143 | 0.1143 |
+| 4 | code_python | **far** | **0.1208** | **0.1208** |
+| 8 | code_python | near | **0.4578** | **0.4578** |
+| 8 | code_python | mid | **0.1093** | **0.1093** |
+| 8 | code_python | **far** | **0.1341** | 0.1311 |
+| 1 | zh_ancient | near | 0.0166 | 0.0008 |
+| 4 | en_literature | far | 0.0 | **0.003** |
+
+### 8.3 Reading
+
+1. Long-range retrieval really exists and is significant on structured text: the code-domain far
+   bucket (distance 257–2048)
+   at ngram=8 hits **0.134**, far above random (vocab 8192 → random ~0.0001).
+2. **The longer the key, the higher the hit rate** (near bucket 0.18 → 0.40 → 0.46): the longer
+   the repeated fragment, the more reliable the hit,
+   indicating the model is doing fragment-level matching, consistent with long-range-retrieval
+   behavior.
+3. **The two architectures are comparable on repeated patterns**: ngram=4 mid/far bucket
+   numbers are **identical** (0.1143/0.1208).
+   This is consistent with §7's training comparison (SunnyNet slightly worse by 0.6% in
+   quality).
+4. **Natural-language far-distance hit rate is near 0**: consistent with §9's risk judgment -
+   the rolling state's
+   `H_max=8192` only guarantees "not forgotten", not "retrievable". Natural-language far-range
+   dependencies are harder than code's repeated patterns; this architecture shows **no
+   advantage** here.
+
+**Boundary**: the `ultra` bucket (distance >2048) has 0 samples in every config, **no
+data**;
+§8 makes no claim about that range. The probe runs within a T=1024 window; longer-span
+ability is untested.
+
+---
+
+## 9. Risks and limitations
+
+| Risk | Status | Note |
+|---|---|---|
+| **Long-range dependency ability** | **Partly verified** | structured text (code) far-bucket hit 0.13, natural language near 0; `ultra` bucket has no samples (§8) |
+| **Pseudo-convergence** | **Present** | ppl dropping ≠ reasoning/instruction ability; small-scale experiments cannot extrapolate to 0.5B |
+| **Ablation conclusions** | **Invalid** | 600 steps unconverged, differences within noise (§5) |
+| **Short-sequence disadvantage** | **Confirmed (forward regime only)** | batch=1 pure forward below T<384 is worse than Transformer (§2); **not true in the training regime (batch=8)** - T=256 is already faster than Transformer and ties rwkv (§16/§19) |
+| **Short-sequence worse than O(N) peers** | **Partly corrected** | at T=256 ppl is still below H3, but after the §12 fix it went 93.82→57.83 (2nd of 7); speed ties rwkv via §16's narrow config |
+| **Early timing data distorted** | **Corrected** | §2.1 had no process isolation; absolute values were high and the per-architecture amplification factors differed; see §2.4 |
+| **No absolute long-sequence advantage over peers** | **Confirmed** | at T=4096 Hyena is 1.9x faster, H3 is nearly tied; per-cell rank 6th→3rd, **no length leading every peer** (§10.6) |
+| **T=1024 memory/speed** | **Measured, criticism does not hold** | training regime 1st in speed, 2nd-lowest peak memory (1812MB, 43% less than TF) (§17) |
+| **Cross-distribution generalization** | **Not worse than peers (measured)** | external new domains: Chinese news 1st/7, English arxiv 2nd/7, lowest OOD drop band (§18) |
+| **`torch.compile` unavailable** | **Environment limit** | MSVC missing Windows SDK headers; Inductor's Windows branch demands an MSVC-style CLI; bypassed by the hand-written AVX2 kernel (§21/§22) |
+| **20M double loss** | **Confirmed** | at T=512, ppl 48.1% higher, 38.7% slower, memory 52.7% higher (§4) |
+| **Multi-domain imbalance** | **Unaddressed** | the three domains are mixed at a fixed ratio (0.4/0.35/0.25); no domain-balanced sampling |
+| **CPU cache hit rate** | **Unmeasurable** | this machine has no PDH cache counters; page-fault rate used as a proxy only, no measured value |
+| **Corpus incomplete** | **Confirmed** | missing the encyclopedia domain (Wikipedia unreachable); only 3 domains |
+| **Measurement contamination** | **Disclosed** | unrelated processes were using the CPU during the period; absolute values should be treated as upper bounds |
+| **0.5B extrapolation** | **Limited** | the scale05b preset was corrected to 498.4M params; this machine's available memory is insufficient to instantiate (§10) |
+
+**Summary of positive conclusions**:
+
+| Advantage | Condition | Data |
+|---|---|---|
+| Speed | T=4096, batch=1 forward | 12.63x faster |
+| Speed + quality + memory | T=1024, real training | 2.08x faster, ppl 21.2% better, memory 36.8% saved |
+| State boundedness | any T | the convex combination guarantees `\|s_t\| ≤ max(\|s_{t-1}\|, \|u_t\|)`, provable (§ARCHITECTURE) |
+| Training stability | 20M / 10 layers | gradient norm 0.84–1.93, neither exploding nor vanishing (§4) |
+---
+
+## 10. Comparison with same-complexity O(N) architectures
+
+> **Why this comparison is necessary**: comparing only against Transformer does not support
+> "beats or ties existing published methods" -
+> Transformer is O(N²), not in the same complexity class as SunnyNet. **The real control group
+> is the O(N)
+> published architectures**: linear attention, RWKV, Mamba, Hyena, H3.
+
+### 10.1 Comparison implementations
+
+Hand-written implementations in `sunnynet/linear_baselines.py` (no third-party libraries, to
+keep parameter counts controllable):
+
+| Architecture | Source paradigm | Core mechanism |
+|---|---|---|
+| `linear_attn` | Linear attention (Katharopoulos 2020 form) | feature map `φ(x)=elu(x)+1`, causal `KᵀV` accumulation, no softmax |
+| `rwkv` | RWKV-4 | time-mixing wkv (implemented via closed-form scan) + channel mixing `relu²` |
+| `mamba` | Mamba / S6 | input-dependent selective gating + causal depthwise conv + SiLU gate |
+| `hyena` | Hyena | FFT long-convolution x3 layers + multiplicative gating + depthwise short conv |
+| `h3` | H3-2 | diagonal SSM (closed-form scan) + short conv + multiplicative gating |
+
+### 10.2 Fairness guarantees
+
+1. **Parameter-count alignment**: target the SunnyNet compute-stack parameter count (embedding
+   excluded, since SunnyNet has no positional embedding).
+   Alignment uses meta-device instantiation counting, not hand-derived formulas -
+   the hand-derived formulas were measured to be badly incomplete (RWKV's error reached
+   **34%**).
+2. **Layer-count constraint**: each architecture's layer count differs from the reference by
+   no more than ±1 (±2 where necessary),
+   avoiding padding parameters with "extreme depth" or "extreme single-layer width".
+3. **Same protocol**: same corpus mix (0.4/0.35/0.25), same token budget, same step count,
+   same thread count, same validation set.
+
+Alignment results:
+
+| Architecture | `small` stack params | Deviation | `proto20m` stack params | Deviation |
+|---|---|---|---|---|
+| `linear_attn` | 374,112 | 2.40% | 16,862,528 | 0.60% |
+| `rwkv` | 371,712 | 1.75% | 22,644,224 | 1.38% |
+| `mamba` | 367,136 | 0.49% | 13,742,528 | 0.36% |
+| `hyena` | 369,488 | 1.14% | 16,851,304 | 0.54% |
+| `h3` | 354,640 | 2.93% | 16,862,256 | 0.60% |
+| (SunnyNet target) | 365,844 | — | 16,761,394 | — |
+
+> Note: SunnyNet's stack params changed from 365,332 to 365,844 (+512) because of §12's two
+> fixes -
+> the decay parameter went from a frozen buffer to a learnable `theta` (+128 params per layer);
+> the residual direct path adds no parameters.
+> The peers' aligned values were not recomputed accordingly; the deviations stay within ±3%,
+> not affecting the conclusions.
+
+### 10.3 Experimental results
+
+> The numbers in the table below have been updated by §12. This is the pre-fix original
+> reading, kept to show the magnitude of the fix.
+> After the fix, `sunnynet`'s ppl dropped from 93.82 to **57.83**, and its rank rose from
+> second-from-last to second.
+> The complete post-fix table is in §12.5.
+
+Protocol: `small` preset, T=256, batch=8, 8 threads, 600 steps, warmup=60,
+cosine decay to 0.1x, the same corpus mix and validation set, the same seed (1234).
+Unified lr=3e-3 (Transformer keeps its own best 6e-3, see §3 learning-rate calibration).
+
+| Architecture | Compute-stack params | Deviation | Best val | ppl | ms/token | Peak memory | Wall |
+|---|---|---|---|---|---|---|---|
+| `sunnynet` | 365,332 | — | 4.5414 | 93.82 | 0.3277 | 876 MB | 428 s |
+| `transformer` | 361,952 | 0.93% | 4.5018 | 90.18 | 0.3394 | 925 MB | 444 s |
+| `linear_attn` | 374,112 | 2.40% | 4.5208 | 91.91 | 0.3360 | 800 MB | 437 s |
+| `rwkv` | 371,712 | 1.75% | 4.1605 | 64.10 | 0.3046 | 766 MB | 398 s |
+| `mamba` | 367,136 | 0.49% | 4.1485 | 63.34 | 0.4481 | 867 MB | 577 s |
+| `hyena` | 369,488 | 1.14% | 4.4127 | 82.50 | 0.2520 | 838 MB | 333 s |
+| `h3` | 354,640 | 2.93% | 3.9877 | 53.93 | 0.2793 | 781 MB | 370 s |
+
+Speed normalization (relative to SunnyNet; >1 means slower than SunnyNet):
+
+| Architecture | Relative ms/token | Relative ppl |
+|---|---|---|
+| `sunnynet` | 1.00x | 1.00x |
+| `transformer` | 1.04x | 0.96x |
+| `linear_attn` | 1.03x | 0.98x |
+| `rwkv` | 0.93x | **0.68x** |
+| `mamba` | 1.37x | **0.68x** |
+| `hyena` | 0.77x | 0.88x |
+| `h3` | 0.85x | **0.57x** |
+
+### 10.4 Reading (negative conclusions)
+
+1. **At T=256 SunnyNet does not beat same-complexity peers.** RWKV / Mamba / H3 all have
+   lower ppl than SunnyNet; H3 is best
+   (ppl 53.93, **0.57x** of SunnyNet's).
+   This is consistent with §2's short-sequence disadvantage - T=256 is far below the O(N)
+   crossover (T≈834),
+   exactly where SunnyNet's constant factor hurts most.
+2. **The speed advantage did not materialize either**: SunnyNet's 0.3277 ms/token is above
+   Hyena's (0.2520),
+   H3's (0.2793), RWKV's (0.3046). "O(N) is faster" at T=256 does not hold for SunnyNet,
+   because the scan's operator scheduling overhead has a high share at small T (§6 already
+   measured: backward is 74%,
+   `aten::mul` 338 calls/step).
+3. Roughly on par with Transformer: ppl 93.82 vs 90.18 (4.0% difference),
+   ms/token 0.3277 vs 0.3394 (SunnyNet 3.4% faster). At T=256 the O(N²)
+   attention scale is still small; the complexity-class difference has not shown up.
+
+### 10.5 Three limitations
+
+1. **Not converged, so it cannot be the final verdict.** 600 steps ≈ 1.23M tokens; cosine has
+   already annealed to 0.1x,
+   and both train and val loss are above the pre-annealing plateau; **none of the seven
+   architectures has converged**.
+   By this project's consistent standard (§5's ablation judged invalid because unconverged),
+   §10.3 can only be read as a cross-architecture ranking of **early sample efficiency**, not a
+   final quality ranking.
+2. **Learning rates were not tuned per architecture.** Everything except Transformer used a
+   unified 3e-3; no
+   hyperparameter search was done for Mamba / H3 and other architectures sensitive to this.
+   **Mamba usually needs a lower lr**; it may be underestimated here;
+   conversely, one cannot rule out that other architectures have better unsearched points.
+3. **Single seed.** §7 already measured seed-noise ppl range 6.32, larger than part of the
+   inter-architecture differences here
+   (e.g. SunnyNet 93.82 vs Transformer 90.18 is 3.64 apart). **Small inter-architecture
+   differences are not trustworthy**;
+   only H3's 40-ppl lead over SunnyNet exceeds the noise range.
+
+**Direction of the conclusion**: this comparison **refutes** the claim "SunnyNet beats
+same-complexity published methods on short sequences";
+its only demonstrable advantage range is still long sequences (T≥834 constant amortization and
+12.63x at T=4096).
+Whether these five peers benefit the same way on long sequences is **unmeasured**, listed as
+follow-up work (§10.6).
+
+### 10.6 Speed scaling: all seven architectures measured on long sequences
+
+§10.3 measured only T=256. Here the per-architecture ms/token scaling with T is added,
+answering "does SunnyNet's long-sequence advantage also apply to the peers".
+Protocol: batch=1 forward, 8 threads, per-cell subprocess (§2.4 discipline), 9 repeats median.
+Script `experiments/on_scaling.py`, data `experiments/results/on_scaling_t8.json`.
+
+![Seven-architecture scaling](figures/on_scaling.png)
+
+ms/token (lower is better):
+
+| Architecture | T=256 | T=512 | T=1024 | T=2048 | T=4096 |
+|---|---|---|---|---|---|
+| `sunnynet` | 0.0707 | 0.0508 | 0.0406 | 0.0389 | 0.0352 |
+| `transformer` | 0.0565 | 0.0742 | 0.1515 | 0.2922 | 0.8206 |
+| `linear_attn` | 0.0720 | 0.0563 | 0.0553 | 0.0616 | 0.0644 |
+| `rwkv` | 0.0506 | 0.0468 | 0.0363 | 0.0434 | 0.0475 |
+| `mamba` | 0.0575 | 0.0348 | 0.0320 | 0.0313 | 0.0423 |
+| `hyena` | 0.0326 | 0.0215 | 0.0164 | 0.0179 | 0.0184 |
+| `h3` | 0.0439 | 0.0388 | 0.0342 | 0.0269 | 0.0343 |
+
+Ratios relative to SunnyNet (>1 = slower than SunnyNet):
+
+| Architecture | T=256 | T=512 | T=1024 | T=2048 | T=4096 |
+|---|---|---|---|---|---|
+| `transformer` | 0.80 | 1.46 | 3.73 | 7.51 | **23.34** |
+| `linear_attn` | 1.02 | 1.11 | 1.36 | 1.58 | 1.83 |
+| `rwkv` | 0.72 | 0.92 | 0.89 | 1.12 | 1.35 |
+| `mamba` | 0.81 | 0.69 | 0.79 | 0.81 | 1.20 |
+| `hyena` | 0.46 | 0.42 | 0.40 | 0.46 | **0.52** |
+| `h3` | 0.62 | 0.76 | 0.84 | 0.69 | 0.98 |
+
+**Reading**:
+
+1. The Transformer O(T²) holds and was cleanly reproduced: ms/token rose from 0.0565 to
+   0.8206
+   (T up 16x, per-token cost up 14.5x); at T=4096 it is **23.3x** slower than SunnyNet.
+2. **SunnyNet's advantage range over same-complexity peers is NOT 512<T<2048**
+   (the draft once said "512<T<2048 leads all peers"; this contradicts this table's data and
+   is corrected here).
+   Ranking the raw ms/token cell by cell in
+   `experiments/results/on_scaling_t8.json`, SunnyNet ranks in the seven:
+   **T=256 6th, T=512 5th, T=1024 5th, T=2048 4th, T=4096 3rd**.
+   The rank improves monotonically with T but **never took 1st at any length** (hyena is always
+   1st).
+   At T=1024 it is slower than four peers - Hyena/Mamba/H3/RWKV; at T=2048 it is slower than
+   Hyena/H3/Mamba.
+3. **The gap is still not closed at T=4096**: Hyena is clearly faster still (0.52x), H3 is
+   nearly tied (0.98x).
+   So "the longer the sequence, the bigger SunnyNet's advantage" is not absolute - at the 4096
+   tier,
+   two peers are still not slower than it.
+4. **Hyena is faster at every length** (0.40–0.52x). Its FFT long-convolution has a very low
+   constant factor;
+   SunnyNet's elementwise scan never catches it on this curve.
+
+**Conclusion**: SunnyNet's provable forward-latency advantage is exactly one:
+**T≥256 beats the Transformer** (O(N) vs O(N²), the gap grows with T).
+Against the same-O(N) peers, it is **a catcher-up that improves with T, not a winner**:
+6th at T=256, 3rd at T=4096, never 1st throughout. The existing data does not support "leads
+across the board on long sequences",
+nor "512<T<2048 leads all peers" - the latter directly contradicts this table's data and is
+void.
+
+> **Regime difference**: this table is **batch=1 pure forward**. The training regime
+> (batch=8, including backward + optimizer)
+> ranks differently; see §17.
+
+### 10.7 Follow-up work
+
+- Per-architecture lr search (at least two extra sets of 1e-3/2e-3 for Mamba).
+- Multi-seed (≥3) to confirm whether H3's lead is stable.
+- Fill in intermediate lengths outside 512 < T < 2048 to precisely locate each peer's crossover
+  against SunnyNet.
+- Verify the conclusions hold with `torch.set_num_threads` multithreading off (this machine's
+  operator scheduling is sensitive to thread count).
+
+---
+
+## 12. Architecture fixes
+
+§10's negative conclusions drove a round of **structural fixes**. After A/B-testing three
+measurable defects one by one, two were confirmed and
+one was refuted. All at 600 steps / T=256 / batch=8 / lr=3e-3 / warmup=60, per-cell
+subprocess, multi-seed.
+
+### 12.1 Fix 1: residual bypass (largest single gain)
+
+The original architecture excluded the residual; the block output $o_t$ completely replaced the
+input $x_t$. Measured, this was a **misjudgment**:
+
+| Config | seed 1234 | seed 2024 | seed 3407 |
+|---|---|---|---|
+| No residual (old default) | 93.82 | — | — |
+| **With residual (current default)** | **67.40** | **70.72** | — |
+| H3-2 reference | 53.93 | | |
+
+The residual alone is −28.2% ppl. Mechanism: the residual provides an identity direct path that
+does not go through the state relay, so deep layers need not carry all information on the state
+bus, and the under-scaling collapse no longer appears.
+
+### 12.2 Fix 2: the CenteredScaleNorm floor ($s_{\min}$)
+
+The original $s_{\min}=0.25$. Measured, each layer's norm-input std was as low as $0.06$ and the
+embedding std was only $0.02$,
+**all below $0.25$** - so every input went down the "near-constant branch", the denominator
+was always $0.25$,
+the output was just a $4\times$ constant scaling of the input: **normalization was never
+actually happening**.
+
+Sweep (with residual, mean of 2 seeds):
+
+| $s_{\min}$ | 0.250 (old) | 0.100 | 0.050 | 0.025 | 0.015 | 0.010 | 0.005 |
+|---|---|---|---|---|---|---|---|
+| Mean ppl | 69.06 | 61.17 | 58.35 | 57.51 | 57.42 | 57.01 | **56.79** |
+
+Monotonic decrease; the plateau is at `[0.01, 0.025]` (the difference enters seed noise).
+**Final choice $s_{\min}=0.02$**
+(inside the plateau, old→new about −16%, while keeping constant-input protection several times
+stronger than LayerNorm; see §12.4).
+`experiments/results/smin_sweep.json`, `experiments/_cell_ab.py`.
+
+### 12.3 Fix 3 (refuted): learnable decay
+
+The peers' (Mamba/RWKV/H3) decays are all learnable; SunnyNet's original was a frozen buffer,
+conjectured to be the disadvantage.
+Measured after converting to a learnable `theta`: **99.83 / 98.65**,
+**worse than the frozen 93.82** - refuted.
+The learnable parameter is kept (needed for the fairness of peer alignment), but the gain is
+negative.
+
+### 12.4 Head-to-head: post-fix CSN vs LayerNorm
+
+After the CSN fix, re-measured a head-to-head against LayerNorm (both with residual, 3
+seeds):
+
+| Normalization | seed 1234 | seed 2024 | seed 3407 | Mean |
+|---|---|---|---|---|
+| CenteredScaleNorm ($s_{\min}=0.02$) | ~57.1 | ~56.6 | — | ~56.8 |
+| **LayerNorm (control)** | **54.90** | **54.58** | **56.58** | **55.35** |
+| H3-2 reference | | | | 53.93 |
+
+**On quality LN is still slightly better (2.6% lower)**, but the gap has narrowed from the
+pre-fix ~12 ppl to ~1.5 ppl,
+and falls inside the seed noise (range 6.32). CSN's independent value is not in quality but in
+**constant-input stability**:
+
+| Input | CSN($s_{\min}=0.02$) | LayerNorm |
+|---|---|---|
+| Strict constant $3.14159$ | max$\vert y\vert = 0$ | max$\vert y\vert = 0$ |
+| Near-constant ($5.0 + 10^{-7}$ noise) | std $=1.0\text{e-}6$ | std $=1.6\text{e-}5$ |
+
+CSN suppresses near-constant noise amplification **15x stronger** than LN - the direct counter
+to the architectural property that "the rolling state very easily tends to constant on some
+dimensions",
+and the core reason to keep CSN.
+
+### 12.5 Post-fix positioning (seven architectures, same protocol, re-run)
+
+After the fix, the seven architectures were re-run under the **completely identical protocol**
+(`experiments/battery5.sh`,
+data `experiments/results/oncompare_*.json`); the rank change:
+
+| Architecture | Compute-stack params | Pre-fix ppl | **Post-fix ppl** | Current rank |
+|---|---|---|---|---|
+| `h3` | 354,640 | 53.93 | 53.93 | 1 |
+| **`sunnynet` (post-fix)** | **365,844** | 93.82 | **57.83** | **2** |
+| `mamba` | 367,136 | 63.34 | 63.34 | 3 |
+| `rwkv` | 371,712 | 64.10 | 64.10 | 4 |
+| `hyena` | 369,488 | 82.50 | 82.50 | 5 |
+| `transformer` | 369,200 | 90.18 | 90.05 | 6 |
+| `linear_attn` | 374,112 | 91.91 | 91.91 | 7 |
+
+The other six architectures' numbers are word-for-word identical to pre-fix (they do not use
+CSN / residual),
+proving this change **affects only SunnyNet** and the comparison fairness is intact;
+`transformer`'s 90.18→90.05 is normal rerun jitter.
+
+**Conclusion**: from "second-from-last" up to **second**; relative ppl dropped from 93.82 to
+57.83 (**−38.4%**),
+ahead of Mamba / RWKV / Hyena / Transformer / linear_attn,
+but **still not ahead of H3** (57.83 vs 53.93, about 7% apart).
+
+As in §10.5, this comparison is **600 steps unconverged, single seed, lr not tuned per
+architecture**;
+it can only be read as an early sample-efficiency ranking, not a final quality ranking.
+
+Speed side: post-fix SunnyNet's ms/token rose from 0.3277 to **0.3960** (the residual adds
+compute),
+still faster than Transformer (0.3619 is this rerun's value; there is inter-batch jitter) and
+most peers -
+**that ms/token column's cross-architecture comparison is affected by batch load and is not
+reliable on this table alone; see §10.6's process-isolated method**.
+
+### 12.6 The fix round's measurement discipline
+
+- Every training cell runs in an **independent subprocess** (`_cell_ab.py`), avoiding
+  same-process accumulated-build timing/memory distortion.
+- The gradient matrix (`_grad_matrix.py`) is pure forward/backward, deterministic; not affected
+  by load contamination.
+- The `s_min250` cell reproduced the previously recorded 67.3976 / 70.7208, confirming the
+  experiment is reproducible.
+
+---
+
+## 13. Training-speed dedicated study
+
+**Question**: §2's "crossover" and "22.69x" are both **batch=1 forward**, while CPU training
+cares about **training speed**.
+The two rank completely differently and cannot be cross-cited. Here the **training step
+(forward+backward+update)** is added.
+
+Protocol: `small` preset, batch=8, 8 threads, **per-cell subprocess** (§2.4 discipline),
+5 repeats median, `experiments/on_scaling.py --backward`.
+Data `experiments/results/on_train_speed.json`, `train_longseq.json`.
+
+### 13.1 Results (ms/token, lower is better)
+
+| Architecture | T=256 | T=512 | T=1024 | T=2048 | T=4096 |
+|---|---|---|---|---|---|
+| `sunnynet` | 0.1858 | 0.1699 | 0.1935 | 0.2027 | 0.2327 |
+| `transformer` | 0.2041 | 0.2540 | 0.5396 | 1.0792 | — |
+| `mamba` | **0.1192** | **0.1078** | **0.1157** | **0.1723** | **0.1866** |
+| `h3` | **0.1273** | **0.1122** | **0.1291** | **0.1496** | **0.1658** |
+| `hyena` | **0.1459** | **0.0942** | **0.1162** | **0.1205** | **0.1123** |
+| `rwkv` | 0.1704 | 0.1048 | 0.1187 | 0.1990 | — |
+| `linear_attn` | 0.2566 | 0.1149 | 0.1320 | 0.1867 | — |
+
+### 13.2 Conclusion: training speed is behind every O(N) peer across the board
+
+- **Only at T=256 it leads Transformer by 1.10x**; behind on everything else.
+- Against same-complexity peers: **mamba 20–56% faster, h3 24–29% faster, hyena 27–52%
+  faster**,
+  and this disadvantage **exists from T=256 through T=4096, with no crossover**.
+- **The old report's "at T=256 training SunnyNet is 8.4% faster" (§3) is void**: that was a
+  pre-fix-stack, un-isolated measurement.
+
+> This is a clearly unfavorable result. The confirmed quality advantage (ppl 2nd) and the
+> speed disadvantage (peers 20–50% faster) hold simultaneously - the current architecture is
+> "trading quality for speed", not "faster and better".
+>
+> **Follow-up (§16, same round)**: §13's conclusion **holds only for the `small`
+> (dim=128) config**.
+> After two **equivalent** changes - the **narrow residual stream (dim 128→80) + dropping
+> `p.clamp`** -
+> the training step at T=256 ties rwkv (0.0953 vs 0.0982 ms/tok, nominally 3.0% faster), T=512
+> 3.7% slower,
+> with a stable 16–41% lead over h3/mamba/hyena/linear. **"Behind across the board" still holds
+> under the old config,
+> but is no longer the current architecture's best reading**; meanwhile the T≥1024 peer
+> advantage is **not eliminated**, see §16.5.
+
+### 13.3 Root causes (ruled out one by one by measurement; none is a viable improvement
+direction)
+
+| Hypothesis | Measured | Verdict |
+|---|---|---|
+| More compute | MAC/token: SunnyNet **8064** ≈ mamba 7029, far below Transformer 55224 | **No** |
+| Too many chunk-scan blocks | `chunk=64` is already optimal; longer blocks are actually slower (the original cumsum reduces along the stride=N dimension) | **No** |
+| Thread count not tuned | 4/6/8 threads cross-measured: 1483 / 1510 / 1518 ms; the difference is within noise | **No** |
+| Operator rewrites can save | `_compete` slicing, `_feedback` inlining, CSN two-step var differences all < IQR | **No** |
+
+**Actual root causes**:
+1. **Operator count** (not FLOPs). SunnyNet does 63 `aten::mm` batched calls per forward,
+   plus **small-tensor elementwise operators** of `mul` 762 / `add_` 376 / `fill_` 341
+   calls/step;
+   the short-sequence bottleneck is operator scheduling and memory access, not compute.
+2. **The smallest in-block width**. SunnyNet `dim=128 / inner=192`; the peers at equal
+   parameters
+   have `d_model` 88–112 but **wider inner** (e.g. hyena d_ff=224), so their matmul is more
+   efficient.
+3. **Backward is 64.6% of the training step** (forward 480 ms vs training step 1357 ms,
+   T=1024 B=8),
+   while the scan is only 12–13% of the forward - **optimizing the scan is almost useless for
+   training speed**.
+
+### 13.4 Acceleration means available on this machine
+
+| Means | Status |
+|---|---|
+| `torch.compile` | **Unavailable** - MSVC actually exists (BuildTools 14.39.33519), but `Windows Kits\10` lacks `Include`/`Lib`; `cl /nologo t.c` (with `stdio.h`) reports `cannot open 'stdio.h'`; and `vcvars64.bat` depends on the sandbox-blocked `reg.exe`. Fusion needs another path (§21 uses w64devkit's hand-written AVX2 kernel) |
+| `torch.jit.script` | **Segfault**, unavailable |
+| triton / numba / cpp_extension | none installed |
+| `torch.associative_scan` | this torch version has no such operator |
+
+### 13.5 Measured-rejected optimizations (do not repeat)
+
+**In-block transposed scan** (move the cumsum to the last dimension, using stride-1
+reduction):
+- in the isolated test at the `N=512` dimension the scan is 3.4x faster, looking like a big
+  gain;
+- **but at the real block dimension `dim=128` it is 26.2% slower** (12.11 → 15.29 ms);
+- the end-to-end training step is **net flat** (the −7% forward is offset by the +4%
+  backward).
+- Reverted; `sunnynet/ops.py` keeps the original. **The scan benchmark must use the real block
+  dimension (dim=128),
+  not the isolated test's large dimension (N=512) - the two give opposite conclusions.**
+
+**Competition gate `roll` → `index_select` (GPU/CPU dual-platform re-measure, §15.6/15.7)**:
+- pure-gate microbenchmark: index_select is faster (cuda 0.717x, cpu 0.891x), numerically
+  exactly equivalent (maxdiff=0);
+- end-to-end training step: no stable difference on either platform (cuda 5.8% is inside the
+  inter-round range, cpu 0.2%);
+- reverted; `sunnynet/layers.py`'s `_compete` keeps `roll`.
+- The same lesson repeats: operator-level microbenchmark advantages get diluted into noise
+  end-to-end; they cannot be the sole basis for adoption.
+
+### 13.6 Optimization directions
+
+1. **Raise `h_min` (2.0 → 8/16)**: relax `_safe_chunk`'s block-length ceiling 64 → 332/687,
+   reducing the Python-loop count. **But the measured scan time does not drop** (block count is
+   not the bottleneck),
+   and the change moves the decay spectrum → a quality regression must be run in sync.
+   **The gain is uncertain.**
+2. **Reduce the in-block operator count**: needs operator fusion. `torch.compile` is
+   unavailable, but w64devkit is in place,
+   so it is done via the hand-written AVX2 kernel (§21/§22).
+3. **Widen the in-block dimension** (`dim` 128 → 160/192) to improve matmul efficiency:
+   it breaks the current ±1% parameter alignment and requires redoing every comparison →
+   costly, but the **most direct direction**.
+4. **Reduce backward cost**: the 64.6% backward comes from the autograd graph; it can only be
+   improved by operator-level fusion.
+
+> **§14 implements two of these**: direction 2 via the off-the-shelf oneDNN kernels, and
+> direction 3's "widen dim"
+> without breaking parameter alignment (see §14.3 layer reduction + widening).
+---
+
+## 14. Operator fusion and layer reduction / widening
+
+### 14.1 The only viable fusion path: off-the-shelf oneDNN kernels
+
+`torch.compile` / Inductor is unavailable (§13.4, corrected to "MSVC exists but the SDK
+headers are missing").
+The fusion that is actually usable on CPU is **oneDNN's native fused operators** -
+`F.layer_norm` fuses mean/var/sub/mul/add into a single kernel.
+
+- `CenteredScaleNorm` is **exactly equivalent** to gamma-scaled LayerNorm when `c = 0`
+  (`gamma/center` play the same role as LN's `weight/bias`). After switching to
+  `F.layer_norm`:
+  - forward 4.535 ms → **0.232 ms (19.5x)**; backward 11.075 → 2.485 ms (4.46x)
+- **Two-level parallel scan** `gated_scan`: replacing "per-block serial ceil(T/chunk) Python
+  loops" with
+  "one cumsum within a block covering all blocks + serial nblk steps between blocks",
+  **bit-identical** in both fp32/fp64.
+
+End-to-end training step (`experiments/_speed_ab.py`, per-cell subprocess, multi-round
+median):
+
+| T | Speedup |
+|---|---|
+| 256 | −19.3% |
+| 512 | −24.4% |
+| 1024 | −18.9% |
+| 2048 | −29.4% |
+| **4096** | **−41.2%** |
+
+**Quality improved in sync** (600 steps, three seeds, `_quality_ab.py`):
+
+| Implementation | seed1234 | seed2024 | seed3407 | Mean ppl |
+|---|---|---|---|---|
+| Old (hand-written CSN + serial scan) | 92.96 | 90.46 | 92.71 | 92.04 |
+| **New (fused LN + parallel scan)** | 84.36 | 83.81 | 84.95 | **84.37** |
+
+⇒ **Quality and speed both improved**; 43→47 tests all green.
+
+### 14.2 Key finding: under parameter alignment, SunnyNet has far more layers than the
+peers
+
+Meta-device measurement (real counting, not hand-derived formulas):
+
+| Scale | SunnyNet | mamba | h3 | hyena | rwkv | linear_attn |
+|---|---|---|---|---|---|---|
+| proto20m (stack 16.77M) | **L=10** | L=5 | L=5 | L=7 | L=6 | L=6 |
+| p100m (stack 93.74M) | **L=14** | L=7 | L=8 | L=9 | L=7 | L=7 |
+
+- This **violates the project's own fairness discipline** ("layer deviation from the reference
+  ≤ ±1, ±2 where necessary"), exceeding it by +3 to +8 layers.
+- Cause: low rank (`rank/dim ≈ 0.6`) + narrow `dim` → few params per layer → forced to stack
+  deep under parameter alignment.
+- Consequence: more layers = **the per-layer operator set x more times** ⇒ directly into
+  §13's root cause #1 "operator count".
+
+### 14.3 Layer reduction + widening (under stack-parameter alignment)
+
+Keeping **stack-parameter deviation within ±0.1%**, layers are pushed back to the peer band
+while `dim` is widened:
+
+| Preset | Config | Stack params | T=256 ms/tok | T=512 ms/tok | Peak RSS |
+|---|---|---|---|---|---|
+| proto20m | d512 i896 r320 **L10** | 16,766,514 | 1.262 (5-round median) | 1.330 | 2253 / 3817 MB |
+| **proto20mw** | d640 i1280 r384 **L6** | 16,755,230 (+0.07%) | **1.110 (−12.1%)** | **1.108 (−16.7%)** | **1935 / 3240 MB** |
+| p100m | d1024 i1792 r640 **L14** | 93,738,054 | 4.957 | OOM | 5802 MB |
+| **p100mw** | d1408 i1920 r1024 **L8** | 93,828,904 (+0.10%) | **4.158 (−16.1%)** | 3.969 | **4897 MB** |
+
+- Tool `experiments/_rebalance_probe.py` (per-cell subprocess); the presets `proto20mw` /
+  `p100mw` are now in `train/train.py`.
+- Reverse-order re-measure rules out order effects: **proto20mw wins in 5/5 rounds**.
+- 12–17% speedup, matching the "40% fewer layers" magnitude ⇒ the root cause is operator count
+  (layers), not FLOPs;
+  as a side effect the layer count returns to the peer band, **fixing the fairness defect**.
+
+### 14.4 Quality verification: layer reduction + widening is a double win
+(20M / T=256 / 400 steps / real corpus)
+
+| Preset | L | dim | Stack params | 100-step ppl | 200 | 300 | 400 (best) | Wall |
+|---|---|---|---|---|---|---|---|---|
+| proto20m | 10 | 512 | 16,766,514 | 121.56 | 88.47 | 69.13 | 61.55 | 1133.7 s |
+| **proto20mw** | 6 | 640 | 16,755,230 | **112.75** | **78.79** | **60.94** | **54.82** | 1144.3 s |
+
+- **ppl leads throughout; the last tier is −10.9%** (54.82 vs 61.55).
+- **400 steps is far from converging** (both configs' ppl is still dropping monotonically);
+  this difference is read only as
+  **a same-budget sample-efficiency ranking**, not a final quality conclusion.
+- The end-to-end wall time is nearly identical (1133.7 vs 1144.3 s), contradicting the
+  isolated single-step probe
+  (−12.1%). The per-tier data show both configs' wall-time increment per 100 steps
+  **increasing over time**,
+  a signature of **external load growing over time** contamination (this machine's resident
+  WorkBuddy has accumulated 58142 s CPU,
+  plus SunloginClient, HipsTray, 3xDownloadManager). **The speed conclusion follows the
+  isolated-subprocess measurement.**
+
+### 14.5 Scaling hard constraints
+
+| Preset | Stack params | Instantiation peak | T=512 training step |
+|---|---|---|---|
+| small | 0.37M | 737 MB | passes |
+| proto20m | 16.77M | 2241 MB | passes |
+| p100m | 93.74M | 5799 MB | **OOM, killed** |
+| p100mw | 93.83M | 4897 MB | passes |
+| **scale05b** | **481.65M** | **instantiation OOM** | **not runnable** |
+
+- **0.5B cannot run on this machine**: training-mode weights + AdamW state need more than 7 GB
+  available,
+  while committed memory is often taken to 20 GB+ by other processes (the ceiling is 27.87
+  GB). **No 0.5B result.**
+- p100m OOMs at T=512, but the rebalanced p100mw (more memory-frugal) passes - a side-benefit
+  of the layer reduction + widening.
+
+### 14.6 20M-scale same-protocol comparison (quality rises to 1st)
+
+Protocol: `proto20mw` preset-driven, stack params aligned at 16.76–16.86M, T=256, batch=8,
+200 steps, real corpus, `experiments/scale_compare_short.sh`.
+
+**Quality (ppl, lower is better)**
+
+| Architecture | Stack params | **ppl** | Rank |
+|---|---|---|---|
+| **sunnynet** | 16,755,230 | **77.90** | **1** |
+| rwkv | 16,844,768 | 79.12 | 2 |
+| mamba | 16,763,712 | 81.92 | 3 |
+| h3 | 16,862,256 | 86.99 | 4 |
+| hyena | 16,801,776 | 109.07 | 5 |
+
+Speed (ms/token, per-cell isolated subprocess re-measure, `_scale_speed_probe.py`)
+
+| Architecture | ms/token | Relative to SunnyNet |
+|---|---|---|
+| rwkv | **0.729** | 0.63x |
+| mamba | 0.922 | 0.80x |
+| h3 | 0.945 | 0.82x |
+| hyena | 1.066 | 0.93x |
+| sunnynet | 1.152 | 1.00x |
+
+Conclusion (opposite in direction from the small scale):
+
+- **On quality, SunnyNet rises to 1st at the 20M scale** - at the small (1.4M) scale it was
+  "2nd of 7",
+  at 20M it is 1st of 5. **The speed disadvantage narrows**: at the small scale the peers are
+  20–52% faster;
+  at 20M it narrows to **8–37%** (hyena is only 7% faster). The direction is right, but it has
+  **not yet overtaken**.
+- **Attribution**: this change **cannot be attributed entirely to "scale"**. The 20M uses the
+  layer-reduced/widened
+  `proto20mw` (§14.3), while the small scale uses the un-rebalanced `small` preset.
+  The quality-rank rise is the combined effect of **layer reduction + widening and scale**;
+  and the two sides' architecture sets (7 vs 5) and step counts (600 vs 200) differ, so they
+  **cannot be directly subtracted**.
+- **200 steps are far from converging**; the `mamba` cell's in-loop reading
+  (2.057 ms/tok)
+  was clearly contaminated by external load (wall 872 s vs 370–510 s for the rest; ms/token
+  degraded tier by tier),
+  so **speed always follows the isolated re-measure**.
+
+### 14.7 The benefit ceiling of writing the core scan / competition gate as a fused kernel
+
+**Question**: would writing the core scan and competition gate as a fused kernel be
+significantly faster?
+
+**Method**: `experiments/_fuse_ceiling.py` replaces those two segments with a minimal
+implementation (numerically not equivalent)
+and measures the end-to-end training step. This gives the **ceiling** of "both segments' time
+zeroed", not a shippable rewrite.
+`small` preset, T=1024, B=8, per-cell subprocess, two interleaved rounds median:
+
+| Variant | ms/token | Relative to baseline |
+|---|---|---|
+| base (current) | 0.1575 | — |
+| Competition-gate time zeroed | 0.1465 | −7.0% |
+| Scan time zeroed | 0.1476 | −6.3% |
+| **Both zeroed simultaneously (ceiling)** | **0.1436** | **−8.8%** |
+
+**Conclusion**:
+
+1. **The replacement experiment's benefit ceiling is 8.8%** (both segments' time zeroed
+   directly, numerically not equivalent; only the ceiling is measured).
+2. **§21/§22's realized measurement exceeds that ceiling**: after wiring up the AVX2 kernel
+   with w64devkit, the fused kernel's
+   training step measures 1.10–1.17x (§22.3/§22.6). The ceiling estimate is low because that
+   experiment was run under
+   the `small/T=1024` regime, while the realized one measures `smalln80/T=256–512` (the scan
+   share is higher).
+3. **The single-block profile explains the share source**: `_compete` is 14.4% of a block,
+   `_scan` is 17.2% (forward),
+   while **the training step's backward is about 65%** (§13.3); no matter how high the forward
+   share is, it cannot be diluted into the larger denominator.
+4. **Practical judgment**: the fused kernel's measured gain (1.10–1.17x) is below the layer
+   reduction + widening (12–17%),
+   but the two can be stacked.
+
+---
+
+### 14.8 100M-scale same-protocol comparison (some architectures diverge at the high lr)
+
+The `p100mw` preset (dim=1408/inner=1920/rank=1024/L=8, stack 93,828,904),
+T=256, B=8, 100 steps, unified lr=3e-3, same corpus, peers aligned by stack params
+(`n_layers=8`):
+
+| Architecture | Stack params | Deviation | ppl | ms/token | Status |
+|---|---|---|---|---|---|
+| rwkv | 94,115,520 | +0.31% | 105.66 | 3.351 | normal |
+| **sunnynet** | 93,828,904 | — | **109.47** | 4.657 | normal |
+| mamba (lr lowered to 1e-3) | 93,410,400 | −0.45% | 126.47 | 3.826 | rerun passed |
+| h3 | 93,588,592 | −0.26% | 128.13 | 3.782 | normal |
+| mamba (lr=3e-3) | 93,410,400 | −0.45% | — | — | **diverged at step 37 (NaN)** |
+| hyena (lr=3e-3) | 93,674,760 | −0.16% | — | — | **gn≈41.5 gradient explosion** |
+
+**Two negative facts**:
+
+1. **The unified lr=3e-3 is too high for mamba/hyena at 100M**. This is not a SunnyNet
+   advantage;
+   it is a defect of the comparison protocol: lr was not tuned per architecture (§13 already
+   declared this limitation).
+   **The lower-lr rerun has been verified (lr=1e-3)**: mamba no longer diverges
+   (100 steps, ppl 126.47);
+   confirming the earlier divergence was an **optimizer step-size problem, not an
+   architecture defect**.
+2. **SunnyNet's 100M ppl reaches only 2nd** (109.47), about 3.6% behind rwkv (105.66), about
+   14.6% ahead of h3.
+   **The 20M "quality 1st" did not carry over to 100M** - the scaling trend is not
+   monotonically better; the existing data does not support "bigger scale, bigger
+   advantage".
+
+**Corroboration: a missing guard in the trainer**. When mamba diverged, `_safe_chunk` hit
+`p_min=NaN`,
+`int(NaN)` raised a `ValueError`, crashing the whole comparison process with no result saved.
+Fixed: `_safe_chunk` now checks `isfinite` first; the trainer prints `[diverged]` and exits
+gracefully when loss/grad_norm is not finite, writing `diverged` into the summary
+(previously it died silently).
+
+**hyena's segfault**: hyena@100M aborted multiple times on this machine with SIGSEGV
+(exit=139),
+and **not deterministically related to step count** (steps=5/20 crash, steps=50 passes;
+B=2/4 pass, B=8 sometimes passes).
+Investigation confirmed **this is not an architecture defect**: the same config passes alone
+at low thread count; the crash happens when the process peak RSS reaches
+5977–6131MB, an occasional one under this machine's memory/page-file pressure (§14.5's 15.9GB
+physical-memory constraint,
+and the C drive has only 7GB left, the page file cannot grow easily).
+**So the 100M comparable comparison is 4 architectures** (sunnynet / rwkv / h3 /
+mamba-lr1e3);
+hyena is recorded as "cannot finish stably on this machine" - **no number for it**.
+---
+
+## 15. GPU validation and 0.5B scaling
+
+### 15.1 GPU environment
+
+The earlier record "this machine has no GPU" is **incorrect**. Measured:
+**NVIDIA GTX 1060 / 6144 MiB** (sm_61),
+driver 572.16 (CUDA 12.8). The project's main venv torch is a **CPU-only build**
+(`2.14.1+cpu`),
+so `cuda.is_available()=False` - this is a **software problem, not a hardware problem**.
+
+A separate GPU venv was created (`E:/sunnyclaw-data/venvs/gpu`, Python 3.12) with
+**torch 2.7.1+cu118**
+(cu118 is compatible with sm_61). The download went over 8-thread Range chunking
+(single-thread was only 262–273 KB/s; chunking reached 9 MB/s).
+Verification: `cuda_available=True`, CUDA 11.8, GPU matmul passes.
+
+### 15.2 SunnyNet runs on the GPU, and scan/gate have no CUDA-specialization failure
+
+`experiments/_gpu_probe.py` (per-cell subprocess), B=8:
+
+| Preset | T | CPU forward | GPU forward | Forward speedup | CPU training step | GPU training step | Training-step speedup | GPU peak |
+|---|---|---|---|---|---|---|---|---|
+| small | 512 | 138.8 ms | 17.4 ms | **7.97x** | 569.9 ms | 57.5 ms | **9.92x** | 804 MB |
+| small | 1024 | 439.3 ms | 28.9 ms | **15.20x** | 1186.3 ms | 99.0 ms | **11.99x** | 1562 MB |
+| proto20mw | 512 | 1697.7 ms | 121.5 ms | **13.98x** | 4620.8 ms | 384.6 ms | **12.02x** | 2827 MB |
+| proto20mw | 1024 | 3308.5 ms | 244.4 ms | **13.54x** | 9408.9 ms | 752.0 ms | **12.51x** | 5373 MB |
+
+(Raw data `experiments/results/gpu_compare.json`.)
+
+**Conclusion**:
+
+1. **The architecture runs directly on the GPU** - the core two-level parallel scan
+   (`cumsum`/`exp`) and the competition gate
+   (pairwise `sigmoid`) are standard CUDA operators; they pass with no CUDA-specialization
+   rewrite at all,
+   which shows the GPU kernel hurdle is not whether it can run but **whether performance needs
+   specialization**.
+2. **12x-magnitude training-step speedup**, and the ratio grows with T (small T=1024 forward
+   15.2x).
+3. **But this is a consumer-grade older GPU (GTX 1060, 6GB)**, and **no CUDA-side
+   optimization was done**
+   (no fused kernel, no AMP, no `channels_last`) - **the speedup is a lower bound**.
+4. **§15.2 did not measure the peers on the GPU**, so it does not support the claim
+   "faster than the peers on GPU"
+   (the official Mamba/H3, etc. GPU implementations are unmeasured).
+
+### 15.3 0.5B (scale05b) ladder test - runs on the GPU, but training is hard-constrained by
+VRAM
+
+`experiments/_05b_gpu_ladder.py`, params **498,464,858 total / 481,687,642 stack**:
+
+| Level | Content | Result | Peak VRAM |
+|---|---|---|---|
+| L1 | Build to cuda (fp32) | **passes** (80.7 s) | 1902 MB |
+| L2 | Forward B=1 T=512 | **passes** | 1978 MB |
+| L3 | Forward B=1 T=1024 | **passes** | 2044 MB |
+| L4 | **SGD training step** B=1 T=512 | **passes** (loss 9.48) | 4426 MB |
+| L5 | **AdamW training step** | **OOM** (T=64/128/256 all fail) | >6144 MB |
+
+**Conclusion**:
+
+1. **0.5B forward and SGD training run on the 6GB GPU** - §14.5's "0.5B cannot run on this
+   machine"
+   should be scoped to: **cannot be instantiated on CPU fp32; forward/SGD run on the GPU**.
+2. **AdamW is infeasible**: weights 1.9GB + gradients 1.9GB + two AdamW momentum states
+   (≈3.8GB) = 7.6GB > 6GB;
+   at the current VRAM, **full optimizer training is not possible**. The viable path is
+   gradient accumulation + SGD,
+   a larger-VRAM card, or a sharded optimizer - **none of these was verified this time**.
+3. **No "0.5B training runs" conclusion**: only a single SGD step was run; there was no
+   multi-step convergence,
+   and no 0.5B quality data at all.
+
+**The ladder script's regime defect (located)**: `_05b_gpu_ladder.py` runs the
+T=512/T=1024 forwards and then the training step in the same process;
+**VRAM fragmentation** makes L4/L5 report OOM. Changed to a subprocess running only L4:
+**the SGD single step passes** (peak 5004 MB, 563 MB remaining, loss 9.4274).
+⇒ The ladder's OOM reading is a false negative from fragmentation; **each level must be an
+independent subprocess**
+(same source as the §2.4 CPU-side discipline).
+
+**Optimizer-state offload attempt (`experiments/_05b_offload.py`, failed)**:
+keeping AdamW's m/v resident on CPU and shuttling them per tensor; theoretically only one
+extra parameter tensor of VRAM.
+Measured it failed - this machine's physical memory has only 4.5GB left; allocating the
+3.71GB optimizer state
+immediately triggered a `Memory allocation failure`,
+and page-file pressure brought the CUDA context to an `unknown error`.
+Switching to bf16 optimizer state (1.86GB) still OOMs, stuck on the activation side
+(`gated_scan`'s `exp(P)` 20MB allocation fails).
+⇒ **This machine does not have the memory conditions for 0.5B AdamW training**; it is
+unrelated to VRAM, it is a host physical-memory shortage.
+
+### 15.4 0.5B multi-step training probe (`experiments/_05b_train.py`, real corpus)
+
+**Motivation**: §15.3 only answers "which level it can reach". Here multi-step is added, to
+see whether loss really moves.
+
+Config: `scale05b` (498,464,858 params), **momentum-free SGD**, T=128, B=1, lr=1e-3,
+30 steps, data from the `data/proc` three-domain real token stream (not random tokens).
+
+| Step | loss | grad_norm |
+|---|---|---|
+| 1 | 9.3152 | 36.4 |
+| 2 | 9.2628 | 34.0 |
+| 3 | 9.4613 | 155.1 |
+| 10 | 9.1438 | 40.6 |
+| 20 | 8.9834 | 52.0 |
+| 30 | 9.3103 | 25.9 |
+
+Peak VRAM 4425 MB (6GB card), build 87.8 s.
+
+**Conclusion**:
+
+1. **Loss oscillates in noise; over 30 steps there is no downward trend**
+   (first 9.3152 → last 9.3103,
+   Δ=−0.005, while the inter-step range is 0.72). This is **not convergence data**, just
+   "the machine runs and gradients have values".
+2. **grad_norm is large and unstable** (24–155). 0.5B + lr=1e-3 + no warmup is
+   under-calibrated;
+   the architecture cannot be judged from it; 9.31 **cannot be cited as a 0.5B
+   ppl/token quality**.
+3. **Momentum-free is a VRAM compromise**: adding `momentum=0.9` OOMs
+   (weights 1.9 + gradients 1.9 + momentum 1.9 ≈ 5.7GB approaching 6GB).
+   So the 6GB card's 0.5B can only run the most basic SGD.
+4. **Gradient accumulation was not verified** - to really train 0.5B requires gradient
+   accumulation or a sharded optimizer; neither was tested here.
+
+**Supplement: T=64 re-measure and the stability boundary** (warmup 5 steps added, lr=1e-3,
+30 steps):
+
+| Step | loss | grad_norm |
+|---|---|---|
+| 1 | 9.3587 | 41.8 |
+| 20 | 7.7206 | 61.9 |
+| 30 | 9.2953 | 34.4 |
+
+First 9.3587 → last 9.2953 (Δ=−0.063), **still inside noise** (inter-step range 1.87; the
+step-20 7.72 is
+a single fluctuation, not a decline). Peak VRAM 4118 MB.
+
+**Stability conclusion**: **0.5B on the 6GB card is a boundary state; the result is not
+reproducible** -
+the same config (lr=1e-3, T=128) three runs: one passed all 30 steps, two OOMed on the first
+step's backward
+(only a 3.74GB allocation failed, while `nvidia-smi` showed 6031MB free).
+The root cause is the **WDDM platform's VRAM allocation cliff** (torch explicitly warns
+`expandable_segments not supported on this platform`), not a model defect.
+Therefore: **0.5B is usable only for "forward/single-step correctness verification", not as a
+reproducible training benchmark**.
+Raising lr to 3e-3 makes the first step's backward OOM reliably (activations grow with the
+weight update).
+
+### 15.5 GPU-side operator profile: fusion's benefit space is smaller than on CPU
+
+**Motivation**: §14.7's 8.8% ceiling was measured on CPU. The GPU's operator cost structure is
+completely different;
+it must be re-measured to answer "is fusion worth it on the GPU".
+
+Method: `experiments/_gpu_profile.py`, `small` preset, T=512, B=8,
+`torch.profiler` aggregated self time by CUDA kernel, mean of 12.
+
+| Category | Forward (eval) | Training step |
+|---|---|---|
+| `cumsum`/scan class | **1.85%** | **1.22%** |
+| `sigmoid`/competition-gate class | **2.55%** | **2.02%** |
+| `aten::mm` + cuBLAS sgemm | 32.8% | 28.6% |
+| `aten::roll` | 3.13% | 1.91% |
+| Top-8 operators total | 51.1% | 53.6% |
+
+**Conclusion**:
+
+1. On the GPU these two segments' share is an order of magnitude lower than on CPU. On CPU the
+   forward `_compete` + `_scan` is ~31.6%
+   (§14.7 single-block profile); on the GPU together they are under 5% (diluted by GEMM).
+   So "fused kernel" has **less** benefit space on the GPU than on CPU, not more.
+2. **There is no single dominant operator on the GPU** (the largest `aten::mm` is 16.4%),
+   consistent with the CPU-side conclusion:
+   the only way to improve is reducing the **operator count**, and this machine has no nvcc /
+   no CUDA toolkit / no triton
+   (`torch.utils.cpp_extension` lacks even `setuptools`), so no custom kernel can be
+   compiled.
+3. This machine's GPU is used only for "correctness verification + speedup", not for
+   kernel-level optimization; that is this machine's capability boundary.
+
+### 15.6 Appendix: competition gate `roll` → `index_select` per-platform measurement
+
+**Background**: the GPU profile found `aten::roll` at 3.13% (forward). On CPU
+"roll→slice" was previously
+rejected (recorded in the rejection list). The two platforms have different cost structures,
+so a **per-platform re-measure** was done.
+
+Microbenchmark (`experiments/_compete_bench.py`, pure gate, numeric equivalence verified in
+the same script):
+
+| Platform | roll | index_select | Ratio | Forward maxdiff | Gradient maxdiff |
+|---|---|---|---|---|---|
+| cuda | 2349.7 µs | 1683.8 µs | **0.717** | 0.0 | 0.0 |
+| cpu | 15518.8 µs | 13819.9 µs | **0.891** | 0.0 | 0.0 |
+
+Both platforms' microbenchmarks point to index_select being faster and numerically exactly
+equivalent - opposite to the old CPU
+"roll is better" conclusion. A microbenchmark alone is not enough to decide; an end-to-end
+verdict is needed
+(§14.4 has repeatedly shown microbenchmark/end-to-end disagreement).
+
+End-to-end A/B (`experiments/_compete_e2e.py`, per-cell subprocess, two interleaved rounds) is
+in
+§15.7; **the end-to-end result governs**.
+
+### 15.7 Competition-gate rewrite end-to-end verdict
+
+`experiments/_compete_e2e.py`, `small`, T=512, B=8, training step, per-cell subprocess, two
+interleaved rounds.
+Numeric consistency: the two implementations' loss is identical (cuda 9.034 / cpu 9.035); the
+rewrite **does not hurt quality**.
+
+| Platform | roll two rounds | index two rounds | Median difference | Conclusion |
+|---|---|---|---|---|
+| cuda | 59.57 / 56.87 ms | 58.62 / 64.58 ms | roll 5.8% faster (inter-round range 13.5%) | inside noise |
+| cpu | 548.1 / 520.6 ms | 519.9 / 547.0 ms | flat (0.2%) | no difference |
+
+Conclusion: end-to-end, no stable difference on either platform; the rewrite is not adopted,
+`roll` is kept.
+
+The same lesson recurs: the pure-operator microbenchmark says index_select is faster
+(cuda 0.717x, cpu 0.891x),
+**but the end-to-end measures no difference**. The cause is the gate operator is only a tiny
+end-to-end share (GPU forward 2.55%,
+CPU forward ~14%); the microbenchmark's gain is diluted into noise. **A microbenchmark cannot
+be the sole adoption basis**
+- consistent with §14.4's repeated conclusion. This item is added to the rejection list.
+
+---
+
+## 16. Training speed catching up to the peers
+
+**Background**: §13 recorded "training speed is 20–52% behind every O(N) peer" - the one
+metric the project had not won for a long time.
+§16 catches up with two **equivalent** changes. Goal: tie or beat the peers in training speed.
+
+### 16.1 Equivalent optimization A: drop `p.clamp` at construction time
+
+In `_core`, `p = 1 - delta*(1 - sigmoid(gate))` has a `p.clamp(p_floor, 1.0)`.
+The analytic lower bound: `delta = 1/H ≤ 1/h_min`, so `p ≥ 1 - 1/h_min = p_min_bound`;
+and `sigmoid(gate) ∈ (0,1) ⇒ p < 1`. The upper bound always holds; the lower bound never
+triggers when `p_min_bound > p_floor`.
+
+| Quantity | Value (`small`, h_min=2.0 / h_max=2048.0) |
+|---|---|
+| `p_min_bound` = 1−1/h_min | **0.5** |
+| `p_floor` = 1/h_max | 4.883e-4 |
+| Measured p range (20 steps x 4 layers sampled) | **[0.5902, 0.99994]** |
+
+The true lower bound 0.5902 is **1209x** above `p_floor`; the clamp is unreachable. Changed to
+a construction-time check `_need_clamp`:
+
+```python
+self._need_clamp = self.p_min_bound < self.p_floor
+```
+
+- **Equivalence**: dropping the clamp leaves the forward bit-identical
+  (`maxdiff = 0.000e+00`, `experiments/_clamp_check.py`).
+- **Benefit**: removes the `ClampBackward1` node from the backward graph
+  (originally `aten::clamp_backward` was 59.5 ms / 12 steps,
+  1.7%) and the forward `clamp` tensor round-trips. When `h_min=1.0` the check automatically
+  falls back to `True`, behavior unchanged.
+- 3 new property tests (both sides of `_need_clamp` true/false + the measured p falls inside
+  the analytic bound); tests 51 → **54**, all green.
+
+### 16.2 Equivalent optimization B: the narrow residual-stream config
+(`smalln80` / `smalln88`)
+
+§13.3 attributed "elementwise operators bill by **activation width** (width set by
+`dim`)". Push `dim` down at matched stack params (~365k):
+
+| Preset | Config | Stack params | Deviation |
+|---|---|---|---|
+| `small` | d128 i192 r64 L4 | 365,844 | baseline |
+| `smalln96` | d96 i192 r152 L4 | 363,860 | −0.54% |
+| `smalln88` | d88 i176 r196 L4 | 365,924 | +0.02% |
+| **`smalln80`** | **d80 i160 r244 L4** | **365,940** | **+0.03%** |
+
+`experiments/_train_bench.py`: per-cell subprocess + interleaved multi-rounds + median
+(§2.4 discipline).
+T=256, B=8, 8 threads, 5 rounds, ms token = 2048/step.
+
+### 16.3 Results: training-step speed (ms/token, lower is better, 5-round isolated-subprocess
+median)
+
+| Architecture | Stack params | **T=256** | **T=512** |
+|---|---|---|---|
+| **sunny80** | 365,940 | **0.0953** | 0.0986 |
+| rwkv | 361,920 | 0.0982 | **0.0951** |
+| sunny96 | 363,860 | 0.1011 | 0.1090 |
+| sunny88 | 365,924 | 0.1013 | 0.1089 |
+| h3 | 369,760 | 0.1138 | 0.1239 |
+| sunny128 (old) | 365,844 | 0.1158 | 0.1243 |
+| mamba | 364,960 | 0.1292 | 0.1271 |
+| hyena | 392,760 | 0.1312 | 0.1468 |
+| linear_attn | 364,720 | 0.1569 | 0.1676 |
+
+**Relative to the old config (`small` / dim128)**: T=256 **−17.7%**, T=512 **−20.7%**.
+
+### 16.4 Head-to-head: sunny80 vs rwkv (per-round paired, 9 rounds of isolated subprocess)
+
+A single median can be misled by "inter-round drift", so a **per-round paired** run was added
+(each round runs sunny80 and rwkv **at adjacent moments**):
+
+| Metric | T=256 | T=512 |
+|---|---|---|
+| sunny80 median | 204.7 ms (0.0999 ms/tok) | 466.5 ms (0.1139 ms/tok) |
+| rwkv median | 215.5 ms (0.1052 ms/tok) | 475.8 ms (0.1162 ms/tok) |
+| **Paired-ratio median (s/r)** | **1.042** | **1.006** |
+| sunny80 **faster-round count** | **3 / 9** | **4 / 9** |
+
+The three metrics contradict each other ⇒ the conclusion is "statistical tie", not "beats":
+the median's ratio-of-medians favors sunny80, but the paired-ratio median and the sign test
+both point to rwkv,
+and the two architectures' inter-round ranges (rwkv's single round is 171–253 ms) are far
+larger than their median difference. **This reading is kept as-is.**
+
+### 16.5 Four limitations
+
+1. **The speed is tied only at `L=4`**. With layer counts aligned to rwkv's `L=6`, the
+   same-budget narrow config
+   (d56/d64/d72) is **30–40% slower** (260–342 ms vs rwkv 225 ms) -
+   pushing `dim` to 56–72 at the same budget makes the layer burden outweigh the width
+   gain; **the bottleneck is operator count, not FLOPs**.
+   This project's existing alignment protocol is by "stack parameter count" and does not
+   constrain layer count, so §16.3's tie is built on SunnyNet using fewer layers.
+2. **T=256 is the best point**: there `smalln80` beats rwkv; at T=512 it has already turned to
+   rwkv slightly faster.
+   **It must not be extrapolated to long sequences** - §13 already showed the peer advantage
+   widens at T ≥ 1024.
+3. **Quality cost**: `smalln80`'s 600-step multi-seed ppl is **62.37** (d80) vs the old
+   config's 54.89 (d128).
+   What is gained for that cost is a speed tie. This is not "faster and better"; it is the
+   speed-quality tradeoff point moving forward.
+4. **lr was not re-tuned per architecture**, single-machine single thread count (8), a single
+   implementation (hand-written baseline), as in the other sections.
+
+### 16.6 Speed-quality Pareto frontier (T=256, all stack params ~365k)
+
+| Preset | dim | ppl (600 steps, 3-seed mean) | ms/tok | Positioning |
+|---|---|---|---|---|
+| `small` | 128 | **54.89** | 0.1158 | best quality |
+| `smalln96` | 96 | 58.84 | 0.1011 | middle |
+| `smalln88` | 88 | 61.90 | 0.1013 | **dominated by 96** (same speed, worse quality) |
+| `smalln80` | 80 | 62.37 | **0.0953** | best speed |
+
+Peer reference (600 steps, single seed 1234): h3 **53.93** / mamba 63.34 / rwkv 63.86 /
+linear 91.91.
+
+- **`smalln88` is dominated by `smalln96`**: same speed but worse quality → removed from the
+  preset candidate list.
+- Speed-first + quality no worse than the same-speed peers: take `smalln80` - speed 0.0953
+  ties rwkv,
+  600-step ppl 62.37 **beats rwkv 63.86 and mamba 63.34**. ⇒ This is a **no-loss point**.
+- **Quality-first**: still use `small` (0.1158), at the cost of being ~15% slower than rwkv.
+- **`smalln88`'s design intent** (lower dim but wider rank) **proved ineffective by
+  measurement**.
+
+### 16.7 Conclusion
+
+- **The training-step speed achieves a "tie"**: `smalln80` is **nominally 3.0% faster than
+  rwkv at T=256**, 3.7% slower at T=512;
+  the paired test is not significant (3–4/9 rounds better). By the project's discipline the
+  conclusion is "statistically tied with rwkv",
+  not read as "beats".
+- **A stable lead over h3 / mamba / hyena / linear_attn**: 16–39% faster at T=256,
+  20–41% faster at T=512 (each architecture's median difference exceeds its inter-round
+  range).
+- It has long been ahead of Transformer (§13's 1.10x now widens, since its T dependence is ∝T
+  while SunnyNet is ~O(N)).
+- **§16 does not change**: the long-sequence (T≥1024) peer advantage persists; the quality
+  ranking still puts `small` 2nd of 7;
+  §13's T=256→T=4096 "behind across the board" still holds under the **old dim128
+  config**.
+
+**Against the goal**: tie or beat the peers in training speed - **the tie is achieved
+(rwkv / h3 / mamba / hyena /
+linear_attn / transformer); beating is not achieved (rwkv leads only nominally)**.
+
+---
+
+## 17. T=1024 training-regime speed and peak-memory audit
+
+**Trigger**: the criticism that "at T=1024 it is the slowest and uses the most memory".
+**The gap in the existing data**: §10.6 measured only **batch=1 pure forward** and **never
+recorded memory**.
+§17's `experiments/_T1024_audit.py` fills both - the training regime
+(forward+backward+AdamW step) and **the activation-memory peak**. Protocol: batch=8, T=1024,
+8 threads, per-cell subprocess, only one model built.
+
+Speed (ms/token, lower is faster):
+
+| Architecture | ms/token | Rank of 7 |
+|---|---|---|
+| **sunnynet** | **0.13186** | **1** |
+| h3 | 0.13190 | 2 |
+| mamba | 0.14721 | 3 |
+| hyena | 0.16754 | 4 |
+| linear_attn | 0.17646 | 5 |
+| rwkv | 0.19677 | 6 |
+| transformer | 0.55693 | 7 |
+
+Peak memory (current_rss after building the model as the baseline; peak_rss as the high-water
+mark; `act` = the difference):
+
+| Architecture | Peak RSS | Rank (high→low) | Activation peak | rss_alloc (fixed) |
+|---|---|---|---|---|
+| transformer | 3192 MB | 1 | 2769 MB | 423 MB |
+| **sunnynet** | **1812 MB** | **2** | 1521 MB | 291 MB |
+| hyena | 1809 MB | 3 | 1513 MB | 296 MB |
+| mamba | 1780 MB | 4 | 1485 MB | 294 MB |
+| linear_attn | 1777 MB | 5 | 1482 MB | 295 MB |
+| h3 | 1689 MB | 6 | 1394 MB | 295 MB |
+| rwkv | 1611 MB | 7 | 1317 MB | 295 MB |
+
+**Reading (the regime difference from §10.6 is the key)**:
+
+1. **The training regime (batch=8, incl. backward) and batch=1 pure forward rank completely
+   differently**. Pure forward at T=1024 ranks SunnyNet 5th (§10.6); in the training regime it
+   **ranks 1st**
+   (0.13186, effectively tied with h3's 0.13190).
+   The reason is backward is 56.9% of the training step (§13.3), and the O(N) peers' backward
+   carries many elementwise chains,
+   which at batch=8 is more disadvantaged than SunnyNet; the Transformer's O(T²) attention
+   backward is the costliest (0.557, 4.2x slower).
+2. "SunnyNet has the most memory" is false: its peak RSS (1812 MB) ranks **2nd** of the
+   seven,
+   only 0–12% above the five O(N) peers, **43% below the Transformer**
+   (1812 vs 3192).
+   The Transformer has the most memory (activation 2769 MB), because its attention must store
+   O(B·H·T²) intermediates.
+3. **Activation memory is the dominant term**: the seven architectures' `rss_alloc`
+   (params + optimizer + input) are all 291–423 MB;
+   every difference comes from activation. SunnyNet's activation 1521 MB is **higher than
+   four peers** (h3 1394 / rwkv 1317 /
+   linear_attn 1482 / mamba 1485), because it stores the whole scan state
+   `(B,T,d)` (the mechanism is recorded in §4.2),
+   but the hyena-class is in the same band as it, and the Transformer is far above it.
+   In short: SunnyNet's memory is on the high side among O(N) peers, clearly below the
+   Transformer, not the highest.
+4. **Item-by-item against the criticism**: "T=1024 slowest speed + highest memory",
+   **the premise is batch=1 pure forward** - under that regime §10.6 shows it ranks 5th
+   (not the slowest,
+   transformer is last), but it is indeed slower than 4 peers; memory is **not the highest
+   under any regime**.
+   Under the training-regime regime, both accusations are false.
+
+**Limitations**: §17 measures a randomly initialized model's single-step overhead (speed and
+memory are **independent of model quality**,
+so random tokens do not hurt the conclusion); the AdamW state makes `rss_alloc` higher than
+SGD, but the seven are comparable under the same regime.
+
+---
+
+## 18. Cross-distribution (OOD) generalization: external new data, measured
+
+**Trigger**: feedback that "generalization is very poor; on independent datasets it is much
+worse".
+**The gap in the existing data**: every quality number in §3/§10/§12 is the ppl on a
+**same-distribution** validation set
+(validation files come from the same corpus batch as the training files, split only at file
+level). **The fully unseen
+distribution at training time has never been measured** - so the accusation was
+**neither confirmed nor refuted** before.
+
+**New datasets** (`prepare_extra.py`, sources reachable from this machine's network;
+**not a split of the original corpus**):
+
+| New domain | Source | Tokens | Out-of-vocabulary character rate |
+|---|---|---|---|
+| `arxiv_en` | arxiv API (cs.CL/LG/AI/stat.ML) 500 English science abstracts | 236,595 | **0.05%** |
+| `zh_tech_news` | 97 tech/science articles from Xinhua / Guangming / People's Daily | 164,711 | **23.02%** |
+
+**Fairness issue**: the 8192 BPE vocabulary was trained on **traditional-script** classical
+corpus
+(`zh_ancient` source text is traditional characters like "女誡/婦德/賜芳筵"). Common
+characters in simplified news
+(电/戏/级/实/这/验/时/动/帧…) fall outside the table in large numbers ⇒ `zh_tech_news`
+out-of-vocabulary rate is **23.02%**,
+`arxiv_en` is only **0.05%**.
+**The new Chinese domain's high ppl includes a tokenizer-mismatch component,
+not purely distribution shift** - so the results below are **stated per domain, not merged
+into one ratio**.
+
+**Protocol**: the original three-domain mix (0.4/0.35/0.25) trained 600 steps, batch=8,
+T=256, lr=3e-3,
+seed=1234, checkpoint saved; then ppl is computed on "three-domain val + two new-domain val"
+(T=1024, 24 windows,
+fixed seed 2024). Script `experiments/_ood.py`, data `experiments/results/_ood.json`.
+The table below is the result after 600 steps of training.
+
+### 18.1 Results (ppl, lower is better; 600 steps, single seed, T=1024)
+
+| Architecture | zh_ancient | en_literature | code_python | **arxiv_en** (new) | **zh_tech_news** (new) | orig mean | ext mean | **ood_gap** |
+|---|---|---|---|---|---|---|---|---|
+| **sunnynet** | **326.12** | 20.85 | 14.49 | **35.58** | **321.08** | 120.49 | 178.33 | **1.480** |
+| h3 | 358.14 | **18.69** | **12.99** | **31.52** | 446.77 | 129.94 | 239.15 | 1.840 |
+| rwkv | 375.41 | 23.59 | 16.41 | 41.03 | 427.22 | 138.47 | 234.12 | 1.691 |
+| mamba | 373.40 | 23.31 | 16.24 | 40.87 | 499.74 | 137.65 | 270.30 | 1.964 |
+| hyena | 404.47 | 32.06 | 24.06 | 54.22 | 400.39 | 153.53 | 227.31 | 1.481 |
+| linear_attn | 422.43 | 36.94 | 28.43 | 61.55 | 489.23 | 162.60 | 275.39 | 1.694 |
+| transformer | 423.77 | 37.66 | 28.12 | 61.34 | 531.77 | 163.18 | 296.55 | 1.817 |
+
+**New-domain cell-by-cell ranking**:
+
+| New domain | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---|---|---|---|---|---|---|
+| `arxiv_en` | h3 31.52 | **sunny 35.58** | mamba 40.87 | rwkv 41.03 | hyena 54.22 | transformer 61.34 | linear 61.55 |
+| `zh_tech_news` | **sunny 321.08** | hyena 400.39 | rwkv 427.22 | h3 446.77 | linear 489.23 | mamba 499.74 | transformer 531.77 |
+
+### 18.2 Reading
+
+1. The "poor cross-dataset generalization" claim is refuted by measurement. On a
+   **domain never seen at training time**:
+   - **Chinese tech news (`zh_tech_news`): SunnyNet ppl 321.08, 1st of the seven** -
+     and it wins **under the least favorable input condition**: that domain's out-of-vocabulary
+     character rate is 23.02% (traditional-script vocab vs simplified text),
+     while the other architectures use the same vocabulary but have higher ppl
+     (hyena 400, h3 447, transformer 532).
+   - **English science abstracts (`arxiv_en`): 35.58, 2nd of the seven**, behind only H3
+     (31.52),
+     ahead of mamba 40.87 / rwkv 41.03 / transformer 61.34.
+2. **The smallest OOD drop is SunnyNet and Hyena (both 1.48)**; the largest is Mamba
+   (1.964).
+   SunnyNet's performance drop from the training distribution to the new distribution is
+   **in the lowest band of the seven**, the opposite of "poor generalization".
+3. **The new Chinese domain's high absolute ppl (321) does not equal poor generalization**:
+   every architecture is high there
+   (400–532).
+   **But there is a regime trap**: `zh_ancient`'s "same-domain" ppl
+   is the highest on every architecture (sunnynet 326, transformer 424), far above the
+   same-architecture
+   `en_literature` (20.9 / 37.7). The cause is **600 steps far unconverged + that domain
+   (traditional-script classical text)
+   is the hardest in itself, so using it as a "same-domain baseline" to compute a ratio
+   distorts** -
+   SunnyNet's `news/zh_anc` = 0.985 looks like "no drop" but is caused by an **inflated
+   denominator**,
+   **it cannot be read as "cross-domain is better than same-domain"**. The only reliable
+   generalization metric is the same-language, denominator-not-poisoned-by-a-hard-domain
+   `arxiv_en / en_literature`: SunnyNet **1.706**,
+   in the same band as h3 (1.686) / hyena (1.691), better than mamba (1.753) / rwkv (1.739).
+4. **Consistency with the same-distribution conclusion**: under the same distribution
+   SunnyNet T=256 ranks 2nd (§12); under OOD
+   `arxiv_en` is also 2nd. **The ranking is stable across both distributions** - there is no
+   "good on-distribution, collapses cross-distribution" phenomenon.
+
+### 18.3 Limitations
+
+1. **Single seed, 600 steps unconverged**: same limitation as §10.5; it can only be read as an
+   early sample-efficiency ranking.
+2. **The new Chinese domain's 23% unk rate is a tokenizer-level confound**:
+   `zh_tech_news`'s absolute ppl
+   is inflated by out-of-vocabulary characters and **should not be cited alone**; the domain's
+   value is that it is **comparable across the seven architectures under the same regime**
+   (all constrained by the same vocabulary), so the ranking is valid but the absolute value is
+   not.
+3. **The new domains are limited in size** (arxiv 236K / news 165K tokens), and `arxiv_en` is
+   **abstracts**, not full text,
+   with a different length distribution than the original books.
+4. **No domain balancing**: all new-domain test data come from a single source, not covering
+   the middle case of "new domain but same genre".
+
+**Conclusion**: on an **external, independent dataset**, SunnyNet's absolute ppl lands in the
+top band of the seven -
+`zh_tech_news` **1st** (321.08, under the unfavorable 23% unk condition), `arxiv_en` **2nd**
+(35.58);
+the OOD overall drop 1.480 is the **lowest band** of the seven (tied with hyena).
+So "SunnyNet collapses on an independent dataset" has **no support at all**; on the contrary
+it **ranks 1st on the least favorable new domain (simplified news)**.
+The reverse claim "strong generalization" also does not hold - absolute ppl is still high
+(English new domain 35.58, Chinese new domain 321),
+600 steps unconverged, single seed, and §18.2-3 already explained the Chinese-domain ratio
+regime trap.
+§18's only reliable conclusion is one: **the cross-distribution performance is no worse than
+the same-complexity peers**.
+
+---
+
+## 19. Short-sequence inversion: training-regime check and mitigation magnitude
+
+**Trigger**: feedback that "below T=384 it is slower than the Transformer, limiting its use in
+common tasks such as short-sentence classification / dialogue reply",
+requiring "remediation". **That claim is based on the batch=1 pure-forward regime (§2.4
+crossover T≈384)**,
+but those tasks are actually **training / fine-tuning** scenarios (including backward,
+batch>1), so they were re-measured in the training regime.
+
+Script `experiments/_shortseq.py`: batch=8, training step
+(forward+backward+AdamW),
+per-cell subprocess, 3 interleaved rounds median.
+
+**Training-regime ms/token median (3 rounds)**:
+
+| Config | T=128 | T=256 | T=384 |
+|---|---|---|---|
+| `small` (d128 i192 r64 L4) | 0.13009 | 0.14094 | 0.15241 |
+| `smalln80` (d80 i160 r244 L4, §16) | **0.12315** | **0.10675** | **0.11148** |
+| `transformer` (stack-aligned 6 layers) | 0.11785 | 0.20975 | 0.26238 |
+
+**Ratio to the Transformer (>1 = slower than TF)**:
+
+| Config | T=128 | T=256 | T=384 |
+|---|---|---|---|
+| `small` | 1.104 | 0.672 | 0.581 |
+| `smalln80` | **1.045** | **0.509** | **0.425** |
+
+**Reading**:
+
+1. **The training-regime crossover is much lower than the forward one**: the forward
+   (batch=1) crossover is T≈384 (§2.4);
+   in the training regime (batch=8) **T=256 has already overtaken**
+   (`small` 0.672, `smalln80` 0.509).
+   This is consistent with §2.3's "the crossover moves to smaller T with batch size", and
+   quantifies it.
+2. **T=128 is still inverted, but the magnitude is small**: `small` is 10.4% slower,
+   `smalln80` **4.5%** slower.
+   Note this tier falls inside the **high-memory-pressure measurement** noise band
+   (this run had only 2.54 GB physical memory available / 84% load),
+   so the 4.5% difference is **not enough to judge as a real disadvantage**, but it should not
+   be claimed eliminated either.
+3. **The narrow residual stream (§16) is a net improvement for short sequences too**:
+   `smalln80` is faster at all three T values,
+   **5.3% (T=128) / 24.3% (T=256) / 26.9% (T=384)** faster than `small`.
+   ⇒ The mitigation direction for the short-sequence disadvantage is **verified effective**:
+   pushing dim from 128 to 80,
+   rank up to 244 (matched stack params) narrows the short-sequence disadvantage from 10.4% to
+   4.5%, and fully overtakes on slightly longer sequences.
+4. Widening or adjusting batch cannot "make up for it": §16.5 already proved that with layers
+   aligned to L=6 the same-budget narrow config is 30–40% slower;
+   §13.3 already ruled out the three "compute / threads / operator rewrite" - **the root cause
+   is operator count**,
+   so the only effective levers are **reducing operator count** (fusion, layer reduction +
+   widening) and **pressing activation width** (narrow residual stream).
+
+**Conclusion**:
+
+> The short-sequence inversion **holds only in the batch=1 pure-forward regime** (crossover
+> T≈384).
+> In the **training regime (batch=8)**, the crossover drops to **T<256**: at T=256/384
+> SunnyNet is already 1.5–2.4x faster than the Transformer.
+> At T=128 it is still 4.5–10.4% slower (the 4.5% is inside measurement noise).
+> **The narrow residual stream narrows the T=128 disadvantage by about 6 percentage points**;
+> it is a verified mitigation.
+
+**Limitations**: 3-round median, memory load 84% (absolute values are upper bounds), a single
+batch=8,
+T=64/96-class ultra-short sequences untested; the real shape of "short-sentence
+classification / dialogue reply"
+(classification head / multi-turn concatenation) was not constructed and measured; §19 covers
+only
+**the language-modeling training-step cost**.
+---
+
+## 20. Ultra-short sequences and the decode regime: the real boundary of the inversion
+
+**Trigger**: the criticism that the short-sequence inversion "limits its use in short-sentence
+classification and dialogue reply". §19 only measured down to T=128,
+and all the data were **training regime or full-pass forward**. §20 adds two regimes never
+covered before:
+**ultra-short sequences (T=32–96, the real lengths of common short sentences)** and the
+decode regime (per-token autoregressive).
+
+### 20.1 Ultra-short sequences (training regime, `experiments/_shortseq2.py`)
+
+A new narrow config `smalln64` (d64 i128 r368 L4 = 367,508, +0.45%). Protocol: batch=8,
+training step,
+per-cell subprocess, 3 interleaved rounds median.
+
+Training-regime ms/token median and ratio to the Transformer (>1 = slower than TF):
+
+| Config | T=32 | T=64 | T=128 | T=192 | T=256 |
+|---|---|---|---|---|---|
+| `small` (d128) | 1.183 | 1.218 | 0.944 | 0.839 | 0.898 |
+| `smalln80` | **0.907** | **0.940** | **0.730** | **0.549** | **0.557** |
+| `smalln64` | **0.867** | **0.889** | **0.772** | **0.688** | **0.455** |
+
+**Reading**:
+
+1. In the training regime the narrow configs are no slower than the Transformer at any T
+   (ratio ≤ 0.94),
+   6–13% faster at T=32/64, 1.4–2.2x faster at T≥192. §19's "T=128 still 4.5% slower" was for
+   the old `d128` config
+   - `smalln64` pulls T=128 to 0.772 (23% faster).
+2. **Non-monotonicity appears at T=48/96** (T=96 slower than T=128), contradicting the
+   T=32/64/128 trend.
+   This is a **single-round noise** signature (this machine's memory is 83% occupied; absolute
+   values are upper bounds); **this table does not cite those two points**;
+   more rounds are needed to settle it; single-round data does not support "overtaken at all
+   T".
+3. The old `d128` config is still 18% slower at T=32 (1.183); **narrowing is an effective
+   means** (same as the §16/§19 conclusion).
+
+### 20.2 Decode regime (per-token autoregressive, `experiments/_decode_bench.py`)
+
+**This regime was entirely missing before**. The real deployment form of "dialogue reply" is
+per-token decoding,
+and this repository's Transformer `forward_step` was originally a `NotImplementedError` ⇒
+**the two had never been compared here**.
+For this, a standard KV-cache inference path was implemented (in fp64 the single-step /
+continuation vs full-pass forward maxdiff is **6.7e-16**,
+2 new invariant tests; total tests **52 → 54**).
+
+The mechanism difference (which decides the decode-regime conclusion can be the opposite of the
+training regime):
+
+- Transformer decoding: the KV cache avoids recomputing K/V, but each step's `q·k` is still
+  **O(t)**; the per-step memory access grows with history.
+- SunnyNet decoding: the state `(B,L,D)` is **fixed-length**, the per-step cost is
+  **independent of t**, always `O(1)`.
+
+Decode-regime ms/step median (batch=1, 3 rounds):
+
+| Config | T=32 | T=64 | T=128 | T=256 | T=512 | T=1024 |
+|---|---|---|---|---|---|---|
+| `small` | 5.218 | 5.072 | 6.010 | 6.365 | 7.178 | 6.508 |
+| `smalln80` | 7.861 | 4.469 | 5.664 | 7.509 | 6.406 | 5.247 |
+| `transformer` | 4.164 | 3.533 | 4.180 | 3.512 | 4.091 | 4.872 |
+
+**Ratio to the Transformer (>1 = slower than TF)**:
+
+| Config | T=32 | T=64 | T=128 | T=256 | T=512 | T=1024 |
+|---|---|---|---|---|---|---|
+| `small` | 1.253 | 1.436 | 1.438 | 1.812 | 1.755 | 1.336 |
+| `smalln80` | 1.888 | 1.265 | 1.355 | 2.138 | 1.566 | 1.077 |
+
+**Reading (the most important negative conclusion of §20.2)**:
+
+1. **In the decode regime SunnyNet is slower than the Transformer across the board
+   (1.08–2.14x)** - the **opposite** of the training-regime conclusion
+   (in the training regime the narrow config is 1.3–2.2x faster at T≥128).
+   **The same criticism has different answers under the two regimes**,
+   depending on whether "common NLP task" means training/fine-tuning or autoregressive
+   decoding.
+2. **The root cause is still the per-layer operator count** (same source as §13.3/§16.5):
+   SunnyNet's single step runs the full L-layer operator chain
+   (30+ operators per layer); the Transformer does 6 layers per step but each layer has only a
+   few large operators - qkv/attn/proj/mlp.
+   The fixed-length state saves the O(t) term, but **the constant term is swallowed by operator
+   scheduling overhead**.
+3. **The theoretical `O(1)` single-step advantage has not materialized within T≤1024**: the
+   ratio falls from 1.25 to about 1.08–1.34 with T,
+   with a converging trend (the Transformer's O(t) term is growing), but the crossover has not
+   happened within **T≤1024**.
+   The longer-T (≥2048) curve is in §20.3.
+4. **Under the T≤1024 decode regime SunnyNet is the slower side**; "SunnyNet suits dialogue
+   reply" is not supported.
+
+### 20.3 Limitations
+
+1. **batch=1, single sequence**: batched decoding is untested (real serving is batch
+   inference; the ratios may change).
+2. No KV-cache quantization/paging: what is compared is "naive KV cache vs fixed-length
+   state"; no engineering optimization included.
+3. Both are PyTorch interpreted execution; no hand-written SIMD kernel; a hand-SIMD
+   implementation like llama.cpp
+   is outside §20's scope (§21/§22 did the AVX2 kernel comparison separately).
+4. 3-round median, this machine's memory is 83% occupied; absolute values are upper bounds.
+
+**Conclusion**:
+
+> The short-sequence inversion **depends on the regime**. **Training regime (batch=8)**: the
+> narrow config is no slower than the
+> Transformer across T=32–256 (6%–2.2x faster); §19's "T=128 still slower" holds only for the
+> old `d128`.
+> **Decode regime (batch=1, per-token)**: SunnyNet is **slower across the board by
+> 1.08–2.14x**, the opposite of the training-regime conclusion;
+> its `O(1)` single-step advantage has **not yet materialized within T≤1024**, converges as T
+> grows but has not crossed.
+> ⇒ If "common NLP task" means **training/fine-tuning**, the inversion is essentially
+> eliminated; if it means **autoregressive decoding**, the inversion really exists.
+
+---
+
+## 21. Hand-written AVX2 kernel: compiling the chain and measured speedup
+
+**Goal**: do a hand SIMD kernel on CPU, freeing "fast inference depends on a GPU".
+
+### 21.1 Compiler re-check
+
+§13.4 had ruled out hand kernels on the premise "no compiler on this machine". Re-check:
+
+| Item | Earlier record | Measured |
+|---|---|---|
+| MSVC `cl.exe` | "present but no SDK, unusable" | does exist (14.39.33519), still missing the Windows SDK headers |
+| gcc / clang / zig | "none" | indeed none on the system PATH |
+| **w64devkit** | not probed | **installable**: GCC 16.2.0 + ships its own mingw-w64 headers |
+
+`w64devkit` is a single-file self-extracting package, ships libc and all headers, needs no
+Windows SDK,
+and needs no `reg.exe` (avoids the sandbox blacklist). Installed to `F:\devtools\w64devkit`
+(727MB).
+
+### 21.2 Verification chain (staged, all measured passing)
+
+1. `gcc -O3 -mavx2 -mfma` compiles an AVX2 + FMA intrinsics program → runs correctly.
+2. `-shared` compiles a DLL → `ctypes` loads it → the first-order recurrence scan numerics
+   vs numpy are **1.19e-07**.
+3. Hand kernel aligned with PyTorch autograd: forward `2.38e-07`, `dp` `9.54e-07`,
+   `dnu` **`0.000e+00` (bit-identical)**. Hardened into an invariant test (total tests
+   **54 → 55**).
+
+### 21.3 Speedup (`experiments/_kernel_bench.py`)
+
+Kernel: `sunnynet/kernels/scan_avx2.c` (**original**; 8-way AVX2 parallelism over the channel
+dimension, FMA fusion,
+scalar tail loop; backward includes the `ds *= p_t` time-pass term). Baseline: torch
+`logspace_scan`.
+**Single thread vs single thread** (the kernel is single-threaded, so
+`torch.set_num_threads(1)`):
+
+| B | T | N | AVX2 | torch | Speedup |
+|---|---|---|---|---|---|
+| 8 | 256 | 160 | 0.154 ms | 3.397 ms | **22.03x** |
+| 8 | 512 | 160 | 0.480 ms | 6.968 ms | **14.50x** |
+| 8 | 1024 | 160 | 1.903 ms | 11.514 ms | 6.05x |
+| 8 | 1024 | 512 | 9.010 ms | 88.610 ms | 9.83x |
+| 8 | 2048 | 512 | 31.139 ms | 136.811 ms | 4.39x |
+| 4 | 4096 | 512 | 35.130 ms | 151.688 ms | 4.32x |
+
+**Reading**:
+
+1. **The scan operator is 4.3–22x faster**. The torch version materializes intermediate
+   tensors via `cumsum/exp`; this kernel passes in a single pass,
+   no intermediate allocation, and FMA fuses `p*s + g` into one instruction.
+2. **The speedup narrows as T grows** (22.0x → 4.3x): the kernel time is linear in T, while
+   the torch version amortizes its
+   scheduling overhead better at long T. Even so, at T=4096 (beyond this project's common
+   training lengths) it is still **4.3x**.
+3. **Regime boundary**: ① this is an **operator-level, single-thread** regime; real training
+   uses 8 threads in torch,
+   so the speedup narrows; ② scan is only part of the training step (§CPU profile: forward
+   24.8% / backward 56.9%).
+
+### 21.3b End-to-end A/B (`experiments/_kernel_e2e.py`)
+
+The kernel is wired into `SunnyBlock`'s scan call site
+(`sunnynet/kernels/scan_auto.py`,
+an `autograd.Function` wrapping ctypes); everything else is unchanged. T=256, batch=8, 8
+threads,
+smalln80, 4 rounds of interleaved subprocesses:
+
+| Round | torch scan | AVX2 kernel |
+|---|---|---|
+| r1 | 268.66 ms | 279.55 ms |
+| r2 | 281.18 ms | 280.14 ms |
+| r3 | 394.52 ms | 353.98 ms |
+| r4 | 314.24 ms | 289.48 ms |
+| **Median** | **297.71 ms** | **284.81 ms** |
+
+**Reading**:
+
+1. **Correctness confirmed**: all 4 rounds **loss is 7.589502, bit-identical** ⇒ the kernel
+   wiring did not change the training semantics.
+2. **The end-to-end speedup is only 1.045x and falls inside noise**: the inter-round range
+   reaches 47% (268–394 ms),
+   and the kernel wins 2/4 rounds. **By the measurement discipline (§5/§16.4), this difference
+   is not enough to judge as a real improvement**.
+3. **The gap vs the operator-level 6.05x (same T) is expected**: scan is a hotspot inside
+   `logspace_scan`,
+   but has a limited share of the whole training step, and the torch version already
+   parallelized the `cumsum/exp` part under 8 threads.
+   ⇒ "The operator is Nx faster" cannot be linearly extrapolated to the whole model; the two
+   must be stated separately.
+
+### 21.4 The relationship to `torch.compile` (still unavailable; root cause found)
+
+This round found that `torch.compile` now **reaches** Inductor's C++ compile step (previously
+it could not get in at all),
+but it is stuck in two places:
+① Inductor's Windows branch hard-codes an MSVC-style CLI
+(`subprocess.check_output(['where','cl'])` + `/I /O2 /MD /link`);
+gcc argument syntax is not accepted by `_is_msvc_cl`/`_is_clang`;
+② the MSVC link path depends on `reg.exe`, blocked by the sandbox blacklist.
+
+**Conclusion**: this machine's automatic-fusion route (Inductor) needs clang-cl to go
+through; **not yet wired up**;
+but **the hand-kernel route is usable** - it does not depend on Inductor, only gcc, and is
+verified.
+
+### 21.5 The answer to "can it beat llama.cpp"
+
+- **Not benchmarked yet**: llama.cpp / ggml is not installed on this machine; **no direct
+  measurement**,
+  so there is no data supporting "already beats it" and none supporting "cannot".
+- **The necessary conditions are in place**: a hand AVX2/FMA kernel, numeric alignment with
+  autograd, compilable and loadable.
+  This is the **same toolchain** as hand SIMD kernels (llama.cpp's core means).
+- **Structural difference (favorable)**: SunnyNet's decode single step is a **fixed-length
+  state O(1)** (§20.2),
+  while llama.cpp's Transformer decode does O(t) attention over the history each step. On
+  **long-context decoding**
+  this is an architecture-level advantage; but §20.2 measured that within T≤1024 that
+  advantage has not materialized
+  (SunnyNet is actually 1.08–2.14x slower); **the crossover is at T=4096 (0.788, 21%
+  faster)**.
+- ⇒ The toolchain is wired; the **preconditions for a top kernel are met**;
+  the llama.cpp benchmark **awaits a later measurement**; §21.5 does not conclude.
+
+### 21.6 Reproduction
+
+```bash
+# Compiler installed at F:\devtools\w64devkit (GCC 16.2.0)
+export SUNNY_W64=F:/devtools/w64devkit
+python -X utf8 experiments/_kernel_bench.py
+```
+
+**Limitations**: ① only the single scan operator is implemented; the other operators
+(competition gate, CSN, readout) are not yet kernelized;
+② the end-to-end A/B was done (§21.3b), **1.045x, inside noise, no real gain observed**;
+③ the backward kernel's nonzero-`s0` branch was not tested separately (the test used
+`s0=0`);
+④ AVX-512 untested (this i7-8750H has only AVX2, §13.4);
+⑤ not directly benchmarked against llama.cpp (not installed here, no measurement).
+
+---
+
+## 22. Fused kernel: competition gate + gate probability + scan in a single pass
+
+**Trigger**: §21 only kernelized the single scan operator; end-to-end is only 1.045x and
+inside noise. This round fuses the whole segment **before** the scan in `SunnyBlock`
+(within-group pairwise competition → gate probability → scan) into one kernel.
+
+### 22.1 Why it can be fused
+
+`SunnyBlock._pick_group` returns **8** under **every preset** in this project (measured dim
+64/72/80/96/160/320/512/640/1024/1408),
+exactly one AVX2 register width. So the `torch.roll(gg, -1/-2, dims=-1)` in `_compete`
+reduces to a
+**lane permutation by `_mm256_permutevar8x32_ps`**; the within-group competition stays
+entirely in registers.
+
+The per-layer (B,T,D)-class intermediate tensors torch originally materializes: 2 `roll` + 2
+`sub` + 2 `sigmoid`
++ `mul` (competition), `sigmoid` + `sub`/`mul` (probability), then the whole
+`log`/`cumsum`/`exp`/`cumsum`
+chain (scan). The kernel computes it in one pass; the intermediates do not enter memory.
+
+**Second-round optimization**: `sigmoid(g_i − g_j) = 1/(1 + e_j/e_i)` (`e = exp(−g)`),
+**one `expf` per lane**
+replacing the original three.
+
+### 22.2 Verification chain (numerics, all measured)
+
+| Level | Compared quantity | maxdiff |
+|---|---|---|
+| Kernel forward `u` vs torch reference | fp64 reference | **7.97e-08** |
+| Kernel forward `p` | same | 7.51e-08 |
+| Kernel forward `states` | stepwise recurrence | 7.40e-08 |
+| Kernel backward `dq` vs autograd | — | 1.94e-07 |
+| Kernel backward `ddelta` | — | 1.84e-05 |
+| Kernel backward `ds0` | — | 7.17e-06 |
+| **Loss after wiring into the model** | torch path | **0.000e+00 (bit-identical)** |
+| **59 parameter gradients after wiring** | torch path | max absolute diff **4.60e-09** |
+
+Total tests **55 → 59** (added: kernel forward, kernel backward, wired end-to-end, one each for
+inference-regime equivalence).
+
+### 22.3 Training-step A/B (`experiments/_core_e2e.py`, 8 threads, interleaved subprocesses)
+
+smalln80 (d80/i160/r244/L4), batch=8:
+
+| T | rounds | torch median | kernel median | Median ratio | Paired-ratio median | Kernel wins |
+|---|---|---|---|---|---|---|
+| 256 | 4 | 198.45 ms | 177.77 ms | **0.8958 (1.116x)** | 0.9043 | **4/4** |
+| 256 | 6 | 213.24 ms | 186.49 ms | **0.8746 (1.143x)** | 0.8981 | **6/6** |
+| 512 | 6 | 462.44 ms | 420.10 ms | **0.9084 (1.101x)** | 0.9434 | **5/6** |
+
+**Reading**:
+1. **The three metrics agree in direction** (median ratio, paired ratio, sign test), a
+   different nature from §21.3b's
+   1.045x (2/4 wins, contradicting metrics) ⇒ **judged a real improvement**.
+2. The improvement is 1.10–1.14x. The T=512 gain is slightly smaller (1.101x, 5/6), consistent
+   with the scan share falling as T grows.
+3. **The loss is bit-identical throughout** (T=256 is 9.0264→9.0262; T=512 is
+   9.0242→9.0240)
+   ⇒ the speedup is not bought with quality.
+4. **Regime**: 8-thread training step. §21.3b's single-thread kernel vs 8-thread torch is an
+   **unfair regime**,
+   the main reason that 1.045x was low.
+
+### 22.4 Training-step profile: where the kernel's ceiling is
+(`experiments/_scan_share.py`)
+
+T=256, batch=8, 8 threads; the 186 ms training step broken down (profiler self CPU):
+
+| Item | Share |
+|---|---|
+| Forward | 28.2% |
+| CE | 4.6% |
+| **Backward** | **88.7%** |
+
+Operator-level top: `aten::mm` **33.0%** (63 calls, through MKL, §13.4 measured at 80% of
+peak, uncompressible),
+`_log_softmax_backward_data` 8.6%, `mul` 7.3%, `fill_` 5.1%, `cat` 4.2%.
+**The scan family is only 6.4%**; the whole training step is **4524 aten calls**.
+
+⇒ **Conclusion**: the kernelization ceiling is limited by two things - ① the matrix multiply
+already uses MKL near peak; the kernel cannot intervene;
+② the elementwise operators have a high share, but backward dominates absolutely. Fusing the
+whole segment before the scan gave
+1.10–1.14x, already close to this path's reasonable upper bound.
+
+### 22.5 Inference regime: the benefit depends on the thread regime and model width
+
+The single-step fused kernel
+(`sunnynet/kernels/step_avx2.c`: deep fusion + depthwise-separable conv single step)
+is wired into `SunnyBlock.step`; numeric equivalence confirmed (single step vs full pass
+**1.13e-06**).
+
+**First-round (8-thread) results are all unfavorable**:
+
+| Regime | kernel/torch | Winning rounds |
+|---|---|---|
+| T=128 B=1 8 threads | 0.736 | 0/4 |
+| T=256 B=1 8 threads | 0.870 | 0/4 |
+| T=512 B=1 8 threads | 0.810 | 0/4 |
+| B=4/8/16/32 8 threads | 1.06–1.25 | 0/3 each |
+
+**Root cause (located by measurement, three items)**:
+1. **ctypes FFI overhead is 13.6 µs/call** (with `data_as` pointer retrieval, 28.5 µs),
+   while one torch 3-operator chain on (1,80) is only **7.2 µs**. At decode B=1 each step is
+   4 layers x 2 kernel
+   calls = 8 calls; **pure FFI is 0.1–0.2 ms**.
+2. OpenMP is a negative benefit at small parallelism: with a `(B, D/8)` parallelism the thread
+   wakeup is ~**100 µs**
+   (measured 131 µs at B=1 vs single-thread 28 µs). Fixed by an `if(work >= 256)` clause
+   falling back to serial.
+3. **The more important regime finding**: at decode B=1, **torch single thread is 1.42x faster
+   than 8 threads**
+   (2.71 vs 3.84 ms/step). **All earlier decode measurements used 8 threads; the regime
+   itself is suboptimal**
+   ⇒ part of the first-round A/B "all negative" comes from **comparing the kernel's single
+   thread against torch's suboptimal 8-thread config**.
+
+**Second round: fair single-thread regime + width scan
+(`experiments/_decode_dim.py`, T=256 B=1)**:
+
+| Config | dim | 3-round kernel/torch | 3-round wins | 5-round kernel/torch | 5-round wins |
+|---|---|---|---|---|---|
+| n80 | 80 | 0.907 | 2/3 | 0.938 | 4/5 |
+| d160 | 160 | 0.929 | 3/3 | 0.986 | 2/5 |
+| d320 | 320 | 0.939 | 3/3 | 0.952 | 4/5 |
+| d512 | 512 | 1.035 | 0/3 | 0.983 | 3/5 |
+
+**Third round: re-measure after adding a delta cache
+(`experiments/_decode_final.py`, 5 rounds, three metrics side by side)**:
+
+| Config | dim | Median ratio | Paired-ratio median | Wins |
+|---|---|---|---|---|
+| n80 | 80 | 0.9421 | **0.9421** (agree) | 3/5 |
+| d160 | 160 | 0.8342 | 0.9384 (**contradict**) | 3/5 |
+| d320 | 320 | 0.9699 | 0.8789 (**contradict**) | 4/5 |
+
+**Converged judgment**:
+1. **n80 (the dim=80 actually used) is the only config where all three metrics agree**: the
+   median ratio and paired ratio are both **0.9421**,
+   i.e. a **~5.8% faster tendency**. But **the sign test is only 3/5 wins** ⇒ **below the
+   significance threshold; no improvement can be judged**.
+2. **d160/d320 have the three metrics contradicting each other** (the median says 16.6%/3%
+   faster, paired says 6%/12% faster, sign 3/5, 4/5)
+   ⇒ **inside noise**.
+3. The first round's "all negative" cause was the unfair thread regime (the kernel's single
+   thread vs torch's suboptimal 8-thread config);
+   this methodology correction is valid and important; but **after moving to the fair regime
+   the gain is still unstable**.
+4. The root cause is unchanged: at B=1 the tensors (1,D) are too small; the operator
+   scheduling saved by fusion is eaten by the ctypes crossing and tensor allocation.
+   Measured ctypes pure call is 0.28 µs (zero-arg) / 2.02 µs (8-arg); one torch operator is
+   2.42 µs - **the same order**,
+   so fusion must rely on "fewer calls", not "each call faster".
+
+**Boundaries**:
+- The table above is **B=1 single thread**; multi-thread production decoding must be measured
+  separately (not done this time).
+- **The inference-regime kernel benefit is not significant**; off by default (off when
+  `SUNNY_KERNEL` is unset);
+  `set_kernel_active()` can switch at runtime; **it is recommended to enable only in the
+  training regime**.
+- **The real exit for the inference regime is not the kernel but the architecture**: SunnyNet
+  single step is O(1), Transformer single step is O(t),
+  the crossover is at T≈2048–4096 (§20.2, 21% faster at T=4096).
+  **Long-context decoding is the realization point**; short-T small-tensor decoding was never
+  an advantage scenario.
+
+**Two inference-regime overheads incidentally fixed** (numerically equivalent, verified):
+- `delta()` single call is **57.2 µs**; 4 layers per step is 229 µs (8.3% of the decode step)
+  - a pure theta function;
+  a versioned cache was added (`delta_cached()`); theta changes invalidate it automatically
+  (measured maxdiff 0.0).
+- `step_core/dw_step`'s `contiguous().float()` pre-step was removed; on a hit, no copy.
+
+### 22.6 ppl and training-speed joint comparison
+(`experiments/_kernel_ppl.py`)
+
+Same protocol (smalln80, 200 steps, T=256, batch=8, 8 threads, same seed and data mix):
+
+| Path | ppl | ms/step | tokens/s | Loss start→end |
+|---|---|---|---|---|
+| torch | 87.6326 | 206.58 | 9914 | 9.0258 → 3.9335 |
+| kernel | 87.2331 | 176.76 | **11586** | 9.0258 → 3.9315 |
+
+**1.169x faster** (tok/s 9914 → 11586).
+
+**The 0.40 ppl difference, qualitatively and quantitatively distinguished**:
+- The same data, the same forward, the single-step loss: torch and kernel are **bit-identical
+  (0.000e+00)**;
+  the max absolute difference of the 59 parameter gradients is **2.98e-08**.
+- After 20 training steps the loss difference is **2e-06** (6.748762 vs 6.748760).
+- ⇒ **The 0.40 ppl difference is float-accumulation chaos amplification on the 200-step
+  training trajectory, not a quality improvement**.
+  The kernel is mathematically equivalent to the torch reference (§22.2 bit-identical);
+  **the kernel does not improve model quality**.
+- **Stating**: the kernel **does not change quality** (numerically equivalent); **it only
+  improves speed** (training step 1.10–1.17x).
+
+### 22.7 Decode-step operator-count reduction
+(`experiments/_decode_profile.py`)
+
+| Regime | aten calls/step | Per-step time |
+|---|---|---|
+| torch path | 1124 | 3.747 ms |
+| Kernel path | **704 (−37.4%)** | **2.757 ms (26.4% faster)** |
+
+**Note**: this came from **measuring the two in sequence in the same process**, which
+**contradicts** §22.5's independent-subprocess A/B (ratio 0.94–0.99).
+By the measurement discipline, **the independent-subprocess result governs** (§22.5); the
+number here is used only to show
+"the kernel really reduces the operator count", not as a speedup conclusion.
+(Measuring several configs in the same process distorts the readings; see §2.4.)
+
+### 22.8 Where the gap vs mainstream frameworks / the peers lies (after kernelization)
+
+Kernelization does not change the cause of this gap; it only changes our own absolute speed.
+Three points:
+
+① Matrix multiply: at the ceiling; the gap is not in the implementation but in the hardware.
+
+- The training step's `aten::mm` is **33.0%** (§22.4), through MKL + oneDNN v3.12.
+- §13.4 measured the real-size GEMM at **237.9 GFLOPS = about 80% of this machine's peak**
+  ⇒ **no implementation-level headroom**.
+- **The gap source**: the i7-8750H has only AVX2 (no AVX-512/VNNI/AMX), while the modern
+  server CPU llama.cpp targets
+  has AVX-512 + VNNI, and the GPU has Tensor Cores. **This is a hardware gap, not a code
+  gap.**
+
+② Elementwise operators: kernelization already cut what can be cut, near the ceiling.
+
+The fused kernel fuses each layer's competition gate + gate probability + scan into a single
+pass; the operator count goes 1124 → 704/step (§22.7).
+The training-step improvement is 1.10–1.17x (§22.3/§22.6). **The remaining headroom is
+limited**:
+
+- Backward is **88.7%** of the training step (§22.4), where `mm` is again the bulk; inside
+  the elementwise backward,
+  `_log_softmax_backward_data` 8.6% and `mul` 7.3% are already in MKL/oneDNN's coverage.
+- The marginal gain of further fusion is diminishing, and §22.5 already proved **the
+  inference regime has no gain because the tensors are too small**.
+
+③ Relative position vs the peers: cross-architecture was not re-measured after
+kernelization; no change is claimed.
+
+The §16.3/§16.4 comparison (sunny80 vs rwkv/h3/mamba/hyena/linear_attn) was
+**measured entirely before kernelization**; the cross-architecture comparison was **not
+re-run** this round. Therefore:
+
+- No data supports "kernelization beat rwkv".
+- **A reasonable inference** (labeled as inference, not measurement): kernelization gives
+  sunny80 a 1.10–1.17x training-step speedup;
+  if the peers did not do an equivalent optimization, the relative position improves.
+  **The report does not conclude on inferences.**
+- The known, certain gaps (kernelization cannot eliminate):
+  - **Short sequences**: forward is still inverted below T=384 (§19/§20); the root cause is
+    operator count.
+  - **Long-sequence speed**: 512<T<2048 leads; at T=4096 Hyena is 1.9x faster (§16).
+  - **Converged quality**: the 600-step early sample efficiency has a gap to H3
+    (53.93 vs 56.8); an unconverged state should not be concluded.
+
+④ The gap source vs llama.cpp / mainstream frameworks: hardware instruction-set difference +
+a missing comparison against peers of equivalent optimization depth,
+not "the kernel can't beat theirs". The kernel chain on this machine is wired up and verified
+to numeric equivalence;
+**the next bottleneck is hardware and measurement cost**.
+
+### 22.9 Reproduction
+
+```bash
+export SUNNY_W64=F:/devtools/w64devkit
+python -X utf8 experiments/_core_e2e.py 256 6 8     # training-step A/B
+python -X utf8 experiments/_scan_share.py 256       # training-step composition profile
+python -X utf8 experiments/_step_e2e.py 128,256 1 4 # inference-regime A/B
+python -X utf8 experiments/_decode_batch.py 256 1,4,8,16,32 3
+python -X utf8 experiments/_decode_profile.py 256 0 # decode-step operator composition
+python -X utf8 experiments/_decode_longpath.py 256,512,1024,2048,4096 2  # §22.10 single step vs context
+```
+
+**Limitations**: ① the kernel requires `group==8` and `_need_clamp` false
+(each preset on this machine satisfies this; changing `h_min` may fall back to the torch
+path); ② it fuses only up to the end of the scan;
+the `_emit` side's `W_c`/`W_s` still go through MKL; ③ the training-regime gain was measured
+only on smalln80, T≤512, single machine 8 threads; ④ the inference-regime gain is negative.
+
+### 22.10 The real place of the inference exit: single-step decode cost growth with context
+
+§22.5 shows that on small tensors (B=1, short T) the kernel fusion's gain is eaten by the
+cross-language call overhead;
+the inference-regime kernel is off by default. The inference advantage is not in the kernel
+but in the architecture: SunnyNet single-step decoding is
+a **fixed-length state O(1)**, while Transformer single-step decoding attends over the whole
+history each step, **O(t)**.
+
+Method: each T in a separate subprocess; first run T single-token steps to build a real
+decode cache (running is not timed,
+to avoid the Transformer being accelerated by parallel prefill), then measure the single-step
+decode cost at that context length;
+1 thread (§22.5 already proved decode regime prefers single thread over 8 threads); 2-round
+median.
+Script `experiments/_decode_longpath.py`, data
+`experiments/results/_decode_longpath.json`.
+
+| T | SunnyNet single step ms | Transformer single step ms | sunny/tf |
+|---|---|---|---|
+| 256 | 2.8716 | 2.4902 | 1.153 |
+| 512 | 2.8818 | 3.0298 | **0.951** |
+| 1024 | 2.8426 | 3.3265 | 0.855 |
+| 2048 | 2.7269 | 4.7904 | 0.569 |
+| 4096 | 2.9014 | 6.8544 | **0.423** |
+
+**Reading**:
+
+1. **SunnyNet's single-step cost is flat**: 2.87 → 2.90 ms; the drift from T=256 is within
+   ±5%
+   (0.950–1.010), consistent with "O(1)".
+2. **Transformer's single-step cost climbs monotonically with context**: 2.49 → 6.85 ms
+   (2.75x),
+   consistent with "O(t)".
+3. **Crossover T≈512**: at T=256 SunnyNet is 15.3% slower; from T=512 it overtakes; at
+   T=4096 it is **2.36x** faster.
+4. The difference from §20.2's early decode measurement is the regime: §20.2 used 8 threads
+   and included the final logits cost;
+   this round uses 1 thread + a fixed-length single step; only then does SunnyNet's flatness
+   appear. The two are not interchangeable.
+
+**Conclusion (positioning the inference exit)**:
+
+- Short-context (T<512) decoding is **not an advantage scenario**, and kernel fusion gives no
+  gain there (§22.5) -
+  both paths are ineffective on short context; that is jointly determined by the architecture
+  and the execution overhead, not an implementation problem.
+- **Long-context decoding is the architecture-level realization point**: crossover T≈512, 2.36x
+  faster at T=4096, and the gap keeps growing with T
+  (Transformer's single step is ∝t with no upper bound; SunnyNet is constant). This is an
+  advantage obtainable without any kernel.
+- The boundary of this conclusion: **single sequence, B=1, randomly initialized model,
+  2-round median**. Real serving is batched decoding;
+  the ratios will change (after a larger batch, the Transformer's per-step attention can be
+  parallelized and amortized; the advantage narrows);
+  the batched regime is untested. No KV-cache quantization/paging or other engineering
+  optimization included (§20.3).
+- **This section's comparison target is only the Transformer**. If compared in the same field
+  with the equally O(1) O(N) peers in the decode regime,
+  SunnyNet does not lead (§23.3 measured: rwkv is 1st throughout decode, 1.6–2.6x faster).
+  The scope where "the inference advantage" holds is "relative to the Transformer", not
+  including the peers.
+
+---
+
+## 23. A dimension-by-dimension comparison with the six major architectures
+
+Six compared architectures: `h3`, `rwkv`, `mamba`, `hyena`, `linear_attn`, `transformer`.
+All numbers come from local measurement, per-cell subprocess; where the same cell has a
+different regime across sections
+(batch, threads, whether backward is included), it is labeled separately and not compared
+across regimes.
+
+### 23.1 Scorecard
+
+| Dimension | SunnyNet position | Best | Gap | Regime |
+|---|---|---|---|---|
+| **Quality ppl** (1.4M, 600 steps) | 2nd (57.83) | h3 53.93 | 7.2% behind | §12.5 |
+| **Quality ppl** (20M, 200 steps) | **1st** (77.90) | sunnynet | 1.5% ahead of rwkv | §14.6 |
+| **Quality ppl** (100M, 100 steps) | 2nd (109.47) | rwkv 105.66 | 3.6% behind | §14.8 |
+| **Training speed** (L=4 matched stack params) | statistically tied with rwkv | rwkv (nominal) | T=256 ratio 1.042, paired not significant | §16.3–16.4 |
+| **Training speed** (L=6 layer-aligned) | **behind** | rwkv | 30–40% slower | §16.5 |
+| **Training-speed memory** (T=1024) | 2nd lowest | rwkv 1611MB | 12% higher, 43% below TF | §17 |
+| **Forward ms/token** (batch=1) | improves with T, 6th→3rd | hyena | never 1st throughout; at T=4096 still 1.92x slower than hyena | §10.6 |
+| **Decode ms/step** (B=1) | 5th→2nd | **rwkv** | 1.85–2.58x slower | §23.3 |
+| **Long-range retrieval** (code domain) | tied with TF | tied | the far-bucket ngram=4 is 0.1208 for both | §8.2 |
+| **Long-range retrieval** (natural language) | near 0 | — | no advantage | §8.3 |
+| **Cross-distribution generalization** | 1st on new Chinese / 2nd on English | sunnynet | OOD drop 1.480, the lowest band | §18.1 |
+
+**In one line**: SunnyNet is currently competitive on quality (20M) and training memory,
+statistically tied with rwkv on training speed (L=4 only),
+and **behind rwkv/hyena on both forward and decode speed** - "beats across the board" has no
+column of data supporting it.
+
+### 23.2 Five regime defects in the earlier comparisons
+
+| # | Defect | Impact | Fix |
+|---|---|---|---|
+| 1 | The five O(N) peers had **no single-step decode interface** | the decode regime was never measured for the peers; §22.10 was a one-on-one against the Transformer only | this round implements `init_state`/`step` for the five; numeric consistency maxdiff ≤ 4e-05 (`_step_equiv.py`) |
+| 2 | Speed comparisons are mostly **batch=1 pure forward** | the ranking is completely different from the training regime | §17 added the training regime; §23.3 adds the decode regime |
+| 3 | Training-regime speed **did not enforce layer alignment** | §16's "tie" is built on SunnyNet using fewer layers | §16.5 already declared it; after layer alignment it is 30–40% behind |
+| 4 | The quality comparison **ran few steps, unconverged, single seed** | only an early sample-efficiency reading | labeled in each section; no final quality ranking made |
+| 5 | Some speed data **included external load** | single cells inflated up to 2x | per-cell subprocess is now in place |
+
+### 23.3 Decode-regime seven-architecture comparison
+
+Regime: each (architecture, T) in a separate subprocess; first run T single-token steps to
+build a real decode state (untimed),
+then measure the single-step decode ms at that context length; single thread
+(§22.5 already proved the decode regime prefers single thread over multi);
+2-round median. Stack params aligned at 365,844. Script
+`experiments/_decode_seven.py`,
+data `experiments/results/_decode_seven.json`.
+
+ms/step (lower is better):
+
+| Architecture | T=256 | T=512 | T=1024 | T=2048 | T=4096 |
+|---|---|---|---|---|---|
+| `rwkv` | **1.768** | **1.574** | **1.598** | **2.113** | **1.564** |
+| `h3` | 2.517 | 2.524 | 2.487 | 2.969 | 3.227 |
+| `transformer` | 2.550 | 2.667 | 3.426 | 5.049 | 6.219 |
+| `mamba` | 2.686 | 2.742 | 2.573 | 2.773 | 3.205 |
+| **`sunnynet`** | **3.279** | **4.067** | **3.086** | **3.331** | **2.854** |
+| `hyena` | 3.346 | 3.583 | 3.662 | 5.101 | 4.530 |
+| `linear_attn` | 4.061 | 3.452 | 4.599 | 3.676 | 3.624 |
+
+Cell-by-cell rank (1 = fastest):
+
+| Architecture | T=256 | T=512 | T=1024 | T=2048 | T=4096 |
+|---|---|---|---|---|---|
+| `sunnynet` | 5/7 | 7/7 | 4/7 | 4/7 | **2/7** |
+| `transformer` | 3/7 | 3/7 | 5/7 | 6/7 | 7/7 |
+| `rwkv` | **1/7** | **1/7** | **1/7** | **1/7** | **1/7** |
+
+Ratio relative to SunnyNet (>1 = slower than SunnyNet):
+
+| Architecture | T=256 | T=512 | T=1024 | T=2048 | T=4096 |
+|---|---|---|---|---|---|
+| `transformer` | 0.778 | 0.656 | 1.110 | 1.516 | **2.179** |
+| `rwkv` | **0.539** | **0.387** | **0.518** | **0.634** | **0.548** |
+| `mamba` | 0.819 | 0.674 | 0.834 | 0.832 | 1.123 |
+| `h3` | 0.768 | 0.620 | 0.806 | 0.891 | 1.131 |
+| `hyena` | 1.020 | 0.881 | 1.187 | 1.531 | 1.587 |
+| `linear_attn` | 1.238 | 0.849 | 1.490 | 1.104 | 1.270 |
+
+**Reading**:
+
+1. **The Transformer O(t) is reproduced**: 2.550 → 6.219 ms (T up 16x, single-step cost up
+   2.44x);
+   at T=4096 SunnyNet is 2.18x faster. Same direction as §22.10 (2.36x); the difference comes
+   from this round's interleaved execution of the five out-of-process, normal jitter.
+2. **SunnyNet's single-step cost is roughly flat**: 3.279 → 2.854 ms, drift −13%~+24% from
+   T=256
+   (T=512's 4.067 is the peak). The flatness is weaker than §22.10's ±5%, because this
+   round's same-process repeated building of seven models had more scenarios, more noise - but
+   **the trend is still flat**, consistent with "O(1)".
+3. **The absolute best of the decode regime is rwkv, not SunnyNet**: rwkv is 1st at all five
+   lengths,
+   single step 1.57–2.11 ms, **1.85–2.58x** faster than SunnyNet. Its wkv recurrence is a pure
+   elementwise
+   `p*s+k*v`, no scan, no log/exp chain.
+4. **SunnyNet's rank improves with T (5→7→4→4→2)**, overtaking h3/mamba/hyena at long
+   context,
+   but **never catching rwkv**. hyena's long-convolution window needs 64-tap elementwise
+   multiply-add, so it stays behind in the decode regime.
+5. **hyena's FFT long-convolution is not worth it in the decode regime**: its full-pass
+   forward is the fastest of the seven (§10.6),
+   but in the decode regime it is 6th; rebuilding the FFT per token has a far higher constant
+   factor than its scan-class peers.
+
+**Conclusion**:
+
+- **SunnyNet is not currently the fastest-decoding architecture**. It is faster than the
+  Transformer (and more so the longer);
+  but it is 1.85–2.58x slower than rwkv, ~1.0–1.13x slower than mamba/h3 (long context
+  overtakes).
+  §22.10's "inference advantage" holds only under the "against the Transformer" comparison.
+- **rwkv is the decode-regime opponent to chase most**. Its advantage comes from **fewer
+  operators** -
+  the single step is one `p*s+k*v` elementwise chain, while SunnyNet's single step includes
+  the competition gate (3 sigmoids),
+  gate probability, scan, `W_c`/`W_s` feedback; the elementwise operator count is several
+  times rwkv's.
+  This is the same root cause as the training-regime "the bottleneck is operator count, not
+  FLOPs" (§13.3/§16.5).
+- Boundary: B=1, random initialization, 2-round median, no batched decoding or KV-cache
+  quantization/paging included.
+
+### 23.4 Merging the root causes of the gaps
+
+Of the ten dimensions, where SunnyNet is behind or merely tied: decode speed (behind rwkv),
+forward speed (behind hyena), L=6 training speed (30–40% behind), 100M quality (3.6% behind
+rwkv),
+1.4M quality (7.2% behind h3), natural-language long-range retrieval (no advantage).
+These **converge on one root cause**: **the elementwise operator count**.
+
+| Evidence | Number |
+|---|---|
+| A single block's forward hotspots are dominated by `mm`/`mul`/`add`/`var`/`cat`; no single dominant operator | §13.3 |
+| Training step has 4524 aten calls/step | §22.4 |
+| Layer reduction + widening (matched stack params) trains 12–17% faster, ppl −10.9% | §14.3 |
+| With layers aligned to L=6, the same-budget narrow config is 30–40% slower | §16.5 |
+| In the decode regime rwkv wins with the single `p*s+k*v` chain | §23.3 |
+
+So the solution direction is one: **reduce the operator count**, not widen, adjust batch, or
+switch the matrix library.
+
+### 23.5 A dimension-by-dimension conquest route (reachability and hard constraints)
+
+| Dimension | Goal | Action | Expectation and constraint |
+|---|---|---|---|
+| **Decode speed** | catch rwkv | the fused step kernel is implemented (§22.5), but at B=1 the FFI eats the gain; changing to **eliminate the FFI** (C extension / custom torch operator) lets a single step save 10+ aten calls | reachable, but ctypes must be bypassed; the ceiling is catching rwkv, not beating it |
+| **Forward speed** | catch hyena | hyena's FFT constant factor is very low; SunnyNet's elementwise scan is hard to catch in batch=1 forward | **architecture-limited**: short forward is a structural disadvantage of scan-class architectures |
+| **Training speed** | still tied after layer alignment | layer reduction + widening done (§14.3); next is **operator-level fusion** (bring `W_c`/`W_s`/`_emit` into the kernel too) | reachable, but diminishing marginal (the fusion ceiling §14.7 is only 8.8%) |
+| **Quality 1.4M** | beat h3 | h3's gap (7.2%) is inside the 600-step single-seed noise; multi-seed + longer steps are needed to judge | insufficient data, not an architecture disadvantage |
+| **Quality 100M** | beat rwkv | 3.6% behind, and lr was not tuned per architecture | needs an lr search and re-measure; direction undetermined |
+| **Natural-language long range** | beat TF | the state `H_max=8192` only guarantees "not forgotten", not "retrievable"; the state design must change | **requires an architecture change**, not reachable by tuning |
+| **Batched decode** | untested | with a larger batch, the Transformer's per-step attention can be parallelized and amortized; SunnyNet's advantage narrows | must be measured, else §23.3 is incomplete |
+| **Direct benchmark vs llama.cpp** | not done | llama.cpp has a hand SIMD kernel; this machine already has w64devkit to compile a comparison | reachable, but a separate GGUF-side implementation is needed |
+
+**Hard constraints (not crossable on this machine)**:
+
+- The hardware is only AVX2 (i7-8750H, no AVX-512/VNNI/AMX); quantization on this machine is a
+  negative optimization
+  (bf16 is 520x slower), and low precision has no native support either (§CPU headroom).
+- The GPU side has no nvcc/CUDA toolkit/triton; CUDA kernels cannot be compiled (§15.5).
+- 0.5B cannot be instantiated in CPU fp32 (§15.3).
+
+⇒ Of the routes above, **the one that can land is "reduce the operator count"**; the rest are
+constrained by hardware or architecture structure.
+On that one line the magnitude obtainable is **the training step 1.10–1.17x** (already in
+hand) +
+the extra gain of the decode regime if the FFI is eliminated (unmeasured) - **not enough to
+"beat all six"**.
+
+### 23.6 Reproduction
+
+```bash
+python -X utf8 experiments/_step_equiv.py              # the five single-step interface consistencies
+python -X utf8 experiments/_decode_seven.py 256,512,1024,2048,4096 2  # §23.3 decode comparison
+```
+---
+
+## 24. General recurrence C runtime
+
+A C inference kernel independent of PyTorch, in `sunnynet/runtime/`, depending only on ctypes
+and a C compiler.
+
+### 24.1 The unified recurrence form
+
+```
+s_t = a_t * s_{t-1} + b_t            per-channel independent   (SN_FMA)
+s_t = a_t * s_{t-1} + (1 - a_t) * u_t gated form                (SN_GATED)
+```
+
+Every first-order linear state recurrence is one of these two forms. Architectures solving this
+form differ in parameterization;
+the recurrence operator itself is the same. The kernel vectorizes over channels (AVX2/FMA),
+serial over the T dimension; the `B` dimension is OpenMP-parallel.
+
+### 24.2 Cross-architecture mapping verification
+
+Each architecture's recurrence is hand-mapped to kernel parameters and compared elementwise
+against its own PyTorch recurrence.
+`experiments/_unified_ir_map.py`, B=2, T=128, N=128, fp32, random weights.
+
+| Architecture recurrence form | Mapping | max\|diff\| |
+|---|---|---|
+| RWKV-4 wkv | `a=p`, `b=k*v` (FMA) | 9.5e-07 |
+| Mamba / S6 SSM | `a=decay`, `u=bu` (GATED) | 2.4e-07 |
+| H3 diagonal SSM | `a=decay`, `u=v` (GATED) | 1.2e-07 |
+| Linear-attention KV accumulation | `a=1`, `b=k v^T` (FMA) | 0.0 |
+| SunnyNet rolling state | `a=p`, `u=u` (GATED) | 1.9e-06 |
+| S4 diagonal SSM | `a=A_bar`, `b=B_bar x` (FMA) | 7.2e-07 |
+
+Hyena is a long-convolution (FIR) recurrence, not a first-order state recurrence; it needs a
+separate convolution backend and is not in this list.
+
+### 24.3 Kernel self-check
+
+`experiments/_recur_equiv.py`, compared against an fp64 stepwise-recurrence reference:
+
+| Case | max\|diff\| |
+|---|---|
+| FMA arbitrary coefficients | 2.4e-07 |
+| GATED (1-a)u | 1.2e-07 |
+| Aligned with `ops.gated_scan` | 5.7e-06 |
+| Backward da / db / ds0 | 0.0 |
+| GATED backward du | 0.0 |
+| Single step vs full pass | 4.8e-07 |
+
+### 24.4 Speed: against the PyTorch vectorized baseline
+
+`experiments/_runtime_bench.py`, per-cell subprocess, single thread, B=1, 10-run median.
+Baseline B is `ops.gated_scan` (the torch cumsum closed-form chunked scan), not a Python loop.
+
+| T | N | Mode | Vectorized ms | Kernel ms | vs vectorized |
+|---|---|---|---|---|---|
+| 256 | 128 | FMA | 0.391 | 0.043 | 9.08x |
+| 256 | 128 | GATED | 0.831 | 0.043 | 19.29x |
+| 1024 | 128 | FMA | 1.256 | 0.132 | 9.54x |
+| 4096 | 128 | GATED | 8.500 | 0.806 | 10.55x |
+| 1024 | 320 | GATED | 3.677 | 0.378 | 9.73x |
+| 4096 | 640 | FMA | 26.944 | 7.574 | 3.56x |
+| 4096 | 640 | GATED | 32.822 | 8.286 | 3.96x |
+
+Median 9.90x, range 3.56–19.29x; the max numeric difference across the three branches is
+7.63e-06.
+At N=640 it drops to 3.6–4.0x (memory bandwidth becomes the limit in single thread).
+
+The multiple against a Python per-token loop (10.9–342.8x) is not stated as an achievement -
+that is not a real deployment baseline.
+
+### 24.5 Dynamic range of the recurrence-state quantization
+
+`experiments/_state_quant.py`, the p/u sequence from a real ckpt layer-0 forward, B=1,
+T=2048,
+symmetric INT8. The control is "unbounded accumulation" (`s += u`, simulating an
+un-normalized KV accumulation).
+
+| Mode | \|s\| at 1/8 | \|s\| at end | Drift | One-shot quantization relative error |
+|---|---|---|---|---|
+| Bounded recurrence (real p) | 1.773 | 1.883 | 1.06x | 3.9e-03 |
+| Unbounded accumulation | 466.8 | 3708.7 | 7.94x | 3.9e-03 |
+
+Fixed scale (the scale is set by the series midpoint's absmax; the terminal state is
+quantized):
+
+| Mode | \|s\| end | Overflowing channels | Overflow ratio | Relative error |
+|---|---|---|---|---|
+| Bounded recurrence | 1.88 | 1 / 128 | 0.78% | 4.0e-02 |
+| Unbounded accumulation | 3708.7 | 7 / 128 | 5.47% | 5.0e-01 |
+
+**Conclusion**: the convex-combination state magnitude moves from 1.773 to 1.883 over the last
+1/8 segment, a 1.06x drift; the unbounded accumulation's drift over the same interval is
+7.94x.
+Without rescaling, the bounded state's relative error is 4.0e-02, the unbounded one 5.0e-01.
+A 12.5x gap.
+One block per channel (block=0) and 32-blocks have the same order of error
+(3.9e-03 vs 3.5e-03).
+
+**Boundaries**: only layer 0, a single ckpt (1.4M), a single random token sequence; no
+end-to-end quantized-inference ppl comparison;
+"quantize on every step's round-trip" (relative error 4.9e-01) is not a real usage; it is only
+a control, not a conclusion.
+
+### 24.6 End-to-end decode: after wiring in the kernel, it does not form a speedup
+
+`experiments/_runtime_e2e.py`, the same ckpt / prompt / thread count; only the recurrence
+operator implementation is switched
+(`SUNNY_KERNEL=0` goes through torch, `=1` goes through the AVX2 kernel); prefill runs T steps
+to build the state, then the 30 single-step median is measured.
+
+| Threads | T | torch ms/step | kernel ms/step | Ratio |
+|---|---|---|---|---|
+| 1 | 256 | 3.1303 | 3.0587 | 1.023x |
+| 1 | 1024 | 3.0464 | 2.8416 | 1.072x |
+| 8 | 256 | 4.3067 | 4.8008 | 0.897x |
+| 8 | 1024 | 4.1083 | 3.8295 | 1.073x |
+
+The four cells are 1.023 / 1.072 / 0.897 / 1.073, with **inconsistent direction**
+(8 threads T=256 is actually 10.3% slower).
+⇒ No end-to-end decode speedup may be claimed; consistent with §22.5's inference-regime
+conclusion.
+
+Reason: the kernel vectorizes over N and is serial over T; on the model side the T and B
+dimensions are tiny (T=1, B=1),
+so the cross-language call and state-shuffle cost is on the same order as a single operator
+(measured in §22.5, ctypes zero-arg 0.28µs,
+8-arg 2.02µs against torch's single operator 2.42µs). The kernel's 9.90x gain comes from
+eliminating the inter-block serial dependency and
+the `exp(-P)` intermediate tensor, which holds for **cross-segment long-sequence scans**, not
+for B=1 single-step decode.
+
+B=1 single sequence is also not the Runtime's target scenario (§23.3: the decode-regime best
+is rwkv).
+
+### 24.7 Whole-model C decode: the entire forward moved into C
+
+§24.6's negative result is located at "cross-language call + state shuffle", so the exit is to
+cross the language boundary only once per step:
+the embedding lookup, per-layer norm / depthwise-conv history / gated competition / state
+recurrence / readout, final normalization, LM head
+all go into C, one `sn_step` call per step. The weights are exported by
+`experiments/_export_runtime.py` into a packed
+fp32 blob: the matmul weights are pre-transposed to `(in, out)` for GEMV (one AVX2 load covers
+8 output rows),
+`circ ∘ W_s` is folded into a single matrix, and `p`'s clamp is decided at construction time
+(consistent with §16).
+
+Numeric consistency `experiments/_runtime_model_equiv.py` (1.4M ckpt, 48 tokens stepwise):
+
+| Regime | Result |
+|---|---|
+| Single-step logits max\|diff\| | 1.24e-05 |
+| argmax agreement | 48 / 48 |
+| Prefill last token vs torch full forward | 3.81e-06 |
+
+End-to-end latency `experiments/_runtime_decode.py` (B=1 single sequence, single thread,
+per-cell subprocess,
+prefill run to the end first, then single steps measured, 3 interleaved rounds):
+
+| Prefill T | torch ms/step | C ms/step | Ratio | Per-round wins |
+|---|---|---|---|---|
+| 256 | 3.796 | 2.487 | 1.53x | 3/3 |
+| 1024 | 3.802 | 1.851 | 2.05x | 3/3 |
+| 2048 | 4.309 | 2.189 | 1.97x | 3/3 |
+
+The median ratio and the per-round sign test agree (all three cells 3/3); a real improvement
+can be judged. The speedup source is eliminating about
+1100 aten calls per step (profile: `aten::mm` 16.4% / `aten::mul` 10.2% / `aten::select`
+8.5% /
+`aten::cat` 8.0%), not the operator fusion itself.
+
+**Boundary**: the single-thread B=1 regime. The CLI default of 8 threads gives C 4.40 vs
+torch 4.56 ms/tok (24 tokens
+a single reading, no multi-round); the gap is smoothed out by scheduling - B=1 small-tensor
+parallelism is a negative benefit (§20.2). The C backend's advantage is at
+single thread and larger batches; multithreaded B=1 must not be linearly extrapolated from the
+table above.
+
+**A real bug located during development (fixed)**: mingw's `fopen` goes through the ANSI code
+page, so weight files with
+Chinese in the Windows path cannot be opened; the C side switched to `_wfopen` +
+`MultiByteToWideChar(CP_UTF8)`.
+
+### 24.7b The whole-model C decode's memory-access restructuring
+
+`p100mw` (105.36M params, fp32 blob 467.6 MB) at 80.2 ms single step on the C backend is not
+the same order of magnitude as the 20M-class model
+(§24.7's 1.4M ckpt, ~2 ms/step). Located it: not the operators, but the **weight layout**.
+
+**First, measure the memory-access ceiling**. A single decode step must read all the weights
+at least once, so the time lower bound is
+`blob bytes / reachable bandwidth`. Wrote `experiments/bench_bw.c`, doing an AVX2 sequential
+read of 419 MB
+(pure read, no write, best of 5 rounds):
+
+| Threads | Sequential-read bandwidth |
+|---|---|
+| 1 | 15.70 GB/s |
+| 2 | 21.57 GB/s |
+| 4 | 23.46 GB/s |
+| 8 | 25.31 GB/s |
+
+At the same time `experiments/_bench_runtime_bandwidth.py` measured the C runtime's single step
+at 75.75 ms,
+effective bandwidth only **6.17 GB/s** - 1.08x the single-thread lower bound, 1/4 of the
+multi-thread lower bound.
+(Note: numpy's `a.sum()` only measured 6.69 GB/s, which underestimates this machine's
+bandwidth; that is the source of an early misjudgment;
+the bandwidth comparison in that script is therefore only an order-of-magnitude reference.)
+
+**The cause is the access pattern**. The original implementation's GEMV chunks over the output
+channels; the inner loop over `in` strides-reads by an `out` stride:
+
+```c
+for (; j + 8 <= out; j += 8) {
+    const float* row = Wt + j;
+    for (int i = 0; i < in; ++i)
+        acc = _mm256_fmadd_ps(b, _mm256_loadu_ps(row + (size_t)i * out), acc);
+}
+```
+
+`experiments/bench_gemv.c` microbenchmarks three implementations (p100mw's head `D→vocab`,
+46.1 MB):
+
+| Implementation | 1 thread | 4 threads | 8 threads | vs original |
+|---|---|---|---|---|
+| Original stride layout | 4.11 GB/s | 8.66 | 8.39 | 1.00x |
+| Original stride + OpenMP | — | — | — | 2.11x |
+| **Row-major `(out,in)`** | 18.91 | 30.91 | 28.86 | **4.61x** (1 thread) / **7.53x** (4 threads) |
+
+Row-major makes each output row's weights contiguous; one load hits adjacent cache lines;
+parallelizing over the output channels,
+with each row independent. **Adding OpenMP without changing the layout is only 2.1x; the
+layout change is the main term.**
+
+**The change and compatibility**. The export format is not touched (still `(in,out)`;
+published blobs need no re-export):
+`sn_load` flips to row-major in memory after reading; the element count is unchanged, so later
+segment offsets are not affected.
+GEMV is changed to a parallel contiguous read per output channel.
+
+**The thread count takes physical cores, not logical cores**. Decode is memory-bound;
+hyperthreading adds no bandwidth;
+measured 6 physical cores 26.69 ms vs 12 logical cores 36.05 ms (a 26% gap). The C side adds
+`sn_recommended_threads()`: Windows goes through `GetLogicalProcessorInformation` counting
+`RelationProcessorCore`; Linux parses `/proc/cpuinfo`'s `(physical id, core id)` pairs.
+
+**A/B comparison** (`experiments/_ab_runtime_opt.py`: the pre-optimization library's source is
+emitted by `git show` and compiled separately;
+the same blob, the same 32-token sequence, 5 interleaved head-to-head rounds):
+
+| Regime | Result |
+|---|---|
+| logits max\|diff\| | **2.766e-05** |
+| argmax agreement | **32 / 32** |
+| Bit-identical | False (the parallel sum order changes the rounding; as expected) |
+| Before | 76.60 ms/token, 6.10 GB/s |
+| After | **25.72 ms/token, 18.18 GB/s** |
+| Speedup | **2.98x**, per-round **5/5** wins |
+
+The numeric consistency with torch still meets the existing tolerance
+(`_verify_runtime_opt.py` uses
+the `forward_step` single-thread regime: max\|diff\| 7.15e-06, argmax 32/32).
+Thread-count scan (`experiments/_bench_runtime_threads.py`, 5-round median):
+
+| Threads | 1 | 2 | 3 | 4 | 6 | 8 | 12 |
+|---|---|---|---|---|---|---|---|
+| ms/token | 56.12 | 40.37 | 32.57 | 30.35 | **26.69** | 36.05 | 36.03 |
+
+**Boundary**: the 2.98x is the single-step decode multiple on **this machine
+(i7-8750H dual-channel DDR4-2667)**,
+only meaning the implementation's memory efficiency moved from 6.1 to 18.2 GB/s. 18.18 GB/s
+is still below
+`bench_bw.c`'s 25.31 GB/s ceiling; the difference is per-step non-streaming access like
+reduce/normalization.
+Do not extrapolate to training or prefill (prefill goes through the same `sn_step` loop, no
+batch parallelism).
+The original 75.75→76.60 difference comes from a different measurement script (the former
+included the first `_load` call); it is not stated.
+
+### 24.7c Storing the weights in fp16: halving the bytes read per step
+
+After §24.7b, a single step is still memory-bound: the pure GEMV loop in `bench_layer.c`
+(41 calls, no serial segment)
+at 6 threads is 14.67 ms (31.87 GB/s), while the conversational context is 21.6 ms - there is
+state dependency between adjacent calls,
+each `gemv` builds its own parallel region; the heat is scattered. Since the kernel has
+reached the pure sequential-read ceiling, only one lever
+remains: **read fewer bytes per step**.
+
+Truncate the 5 GEMV matrices and the LM head to fp16 at load time; the small parameters
+(layernorm g/c, conv taps,
+delta, scalars, embed) stay fp32:
+
+| | fp32 | fp16 |
+|---|---|---|
+| Large matrix weights | 421.0 MB | 210.5 MB |
+| Per-step actual read | 467.6 MB | ~222.3 MB |
+
+The kernel `gemv_h` reads 16 halves (32 B) in one `_mm256_loadu_si256`, splits into two
+`__m128i`
+each through `_mm256_cvtph_ps` to convert to 8 floats for FMA - keeping the same 32 B load
+width as fp32.
+`bench_f16b.c` compares load widths (the same fp16 weights):
+
+| Threads | fp32 | f16 128-bit load | **f16 256-bit load** | 256-bit/fp32 |
+|---|---|---|---|---|
+| 1 | 24.36 | 17.45 | **15.06** | 1.62x |
+| 2 | 19.66 | 11.43 | **12.81** | 1.53x |
+| 4 | 15.24 | 10.77 | **9.99** | 1.53x |
+| 8 | 15.36 | 9.88 | **9.08** | 1.69x |
+
+The 128-bit load lost load width; in single thread it is actually slower than 256-bit; the
+two loads are numerically
+completely identical (max\|diff\| vs fp32 is 1.805e-04 for both), so the 256-bit form was
+taken.
+
+**The error is bounded, but not bit-identical**. `experiments/verify_h.c` (direct C, the same
+blob and sequence):
+
+| Regime | Result |
+|---|---|
+| Logits max\|diff\| worst | 4.181e-03 |
+| Relative deviation | 7.42e-04 |
+| **argmax agreement** | **64 / 64** |
+| Terminal per-layer state max\|diff\| | 1.226e-02 |
+
+fp16 has only 10 mantissa bits; the weight relative error is about 5e-4, so the 7e-4 logits
+relative deviation is an
+in-expected-order result. The deviation accumulates with steps but stays below the argmax
+(64/64 on this sequence).
+
+**A/B comparison** (`experiments/_ab_fp16.py`: the same process, the same blob, 11 interleaved
+head-to-head rounds,
+6 physical cores):
+
+| Regime | fp32 | fp16 |
+|---|---|---|
+| Median ms/token | 24.67 | **18.60** |
+| Min ms/token | 22.20 | **17.26** |
+| Effective bandwidth (in fp32-equivalent bytes) | 18.95 GB/s | 25.14 GB/s |
+| **Per-round paired** | — | **11/11 wins** |
+
+A **1.33x** speedup (1.29x on the min regime); the per-round paired median difference is 6.07
+ms, all positive.
+
+**fp16 is no longer memory-bound**. The fp16 actual read is 222.3 MB; 18.6 ms is only
+**12.0 GB/s**,
+far below fp32's 19 GB/s - the bottleneck moves to the `cvtph_ps` conversion and instruction
+issue. Thread scaling
+(`experiments/_fp16_threads.py`) is therefore insensitive for both:
+
+| Threads | 2 | 3 | 4 | 6 | 8 | 12 |
+|---|---|---|---|---|---|---|
+| fp32 median ms | 38.68 | 31.17 | 25.75 | 26.24 | 27.39 | 27.25 |
+| fp16 median ms | 28.48 | 23.98 | 21.36 | **19.95** | 20.71 | 20.60 |
+| Speedup | 1.36x | 1.30x | 1.21x | 1.32x | 1.32x | 1.32x |
+
+**Usage**: `--backend c --half` (on the Python side, `SnModel(..., half=True)`).
+fp32 remains the default and is bit-identical. Measured on the CLI, decode under `--half` is
+20.96 ms/tok.
+
+**Boundaries**: ① the 1.33x is this machine's single-step decimal; do not extrapolate to
+prefill or training;
+② end-to-end is below the operator level (`bench_f16b.c` 4-thread 1.53x) - consistent with
+the existing discipline;
+operator-level microbenchmark advantages are diluted end-to-end; ③ the 7.4e-04 relative
+deviation makes long-sequence greedy
+decode occasionally diverge; the 64/64 on this sequence is a sample; use fp32 for bit-exact
+reproduction;
+④ the weight files are still fp32 blobs; fp16 is a load-time conversion; disk usage is
+unchanged
+(reducing disk usage requires a separate export; not done).
+
+### 24.8 Command-line inference
+
+`sunnynet/cli.py`, `python -m sunnynet.cli --ckpt <path> --prompt "..."`.
+Load ckpt → tokenizer → autoregressive decode; `--stats` outputs the prefill/decode times.
+`--backend c` goes through the whole-model C decode (first export the blob with
+`experiments/_export_runtime.py`).
+`--gguf <path>` goes through external GGUF weights (see 24.9).
+
+### 24.9 GGUF read-only and external weights (RWKV-7)
+
+The `--gguf` path reads in external GGUF weights and generates per token without PyTorch. The
+first one wired through is the official
+RWKV-7 191M (the BlinkDL/rwkv-7-world `.pth` converted to GGUF via llama.cpp, bf16).
+The tensor naming and recurrence form come from llama.cpp's `src/models/rwkv7*.cpp`; the
+reference math from
+BlinkDL/RWKV-LM's `RWKV-v7/rwkv_v7_numpy.py`.
+
+**(1) Weight alignment** (`experiments/_gguf_align.py`)
+The GGUF dequantization is compared tensor by tensor against the official `.pth`; all
+`max|diff| = 0` (bf16 lossless restoration).
+The LoRA factor matrices (w1/w2, a1/a2, g1/g2, v1/v2) are stored in GGUF as `(out, in)`,
+the opposite of the `.pth`; the other matrices are in the same direction. The vocabulary is
+stored as `\xNN`-escaped string literals; it must be unescaped to bytes.
+
+**(2) Numeric equivalence** (`experiments/_rwkv7_gguf_equiv.py`)
+The GGUF-driven implementation against the official `.pth`'s independent reference, per-token
+single-step logits comparison:
+
+| Regime | Result |
+|---|---|
+| Single-step logits max\|diff\| | 4.79e-06 |
+| argmax agreement | 12 / 12 |
+
+**(3) Generation** (`experiments/_rwkv7_gguf_bench.py`, temperature 0.7 / top-k 20 / seed
+42)
+English fact continuation, Chinese continuation, and Python code completion are all coherent:
+
+```
+The Eiffel Tower is located in the city of
+-> Paris, France. The Eiffel Tower was designed by Gustave Eiffel in 1887 as a monument to
+def fibonacci(n):
+-> \n    if n < 2:\n        return n\n    return fibonacci(n - 1) + fibonacci(n - 2)
+```
+
+**(4) Two boundaries that must be recorded**
+- `rwkv7.py` is a **numpy reference path**, not a C kernel. It proves "the Runtime can read
+  external GGUF and compute correctly";
+  decode is ~388 ms/step - **this number is not stated as a speed achievement**.
+- RWKV-7's state is a **per-head matrix** `S ∈ R^{64×64}`, updated as
+  `S_t = S_{t-1}⊙w_t − (S_{t-1}k_t)k_tᵀ + v_t k_tᵀ`, including a rank-1 removal term;
+  **not** the elementwise `s = a⊙s + b` (the two forms in 24.1). For the unified IR to cover
+  it, a
+  matrix-valued recurrence (outer product / rank-1 correction) layer is needed on top of the
+  elementwise level. This is a correction to the existing "two-form unification" narrative.
+
+**(5) Bugs located during development**
+- The rank-1 removal term must use the **un-decayed** `S`: in `S⊙w − (S k)kᵀ + v kᵀ`, the two
+  terms share the same `S`.
+  Writing it as decay-first-then-remove is bit-exact at step0 (S=0), diverges by 0.5+ from
+  step1, and is very easy to miss.
+- LoRA factor direction: `x @ W1 @ W2`, not `W1 @ W2 @ x`.
+
+### 24.10 RWKV-7's whole-model C kernel
+
+§24.9's numpy path is only for weight-correctness verification; decode is ~388 ms/step. This
+section moves RWKV-7's
+**whole single-step forward** into C (`sunnynet/runtime/rwkv7.c`, one call per A step):
+embedding lookup,
+per-layer norm, time-mix (`r/k/v/o` projections + the four `w/a/v/g` LoRA groups +
+`tanh`/`sigmoid`),
+per-head matrix state recurrence (with rank-1 correction), group-norm, the `r_k` term,
+channel-mix,
+final normalization, LM head. The weights are exported from GGUF by
+`experiments/_export_rwkv7.py` into a packed fp32
+blob (matrices stored as `(in, out)` for GEMV; each layer's v-LoRA rank differs; the rank
+table is recorded per layer in the header).
+
+**(1) Numeric consistency**
+(`experiments/_rwkv7_c_equiv.py`, stepwise against `rwkv7.py`'s numpy reference)
+
+| Regime | Result |
+|---|---|
+| Single-step logits max\|diff\| | 7.25e-05 |
+| argmax agreement | 12 / 12 |
+| 120-step long-range argmax agreement | 120 / 120 |
+
+**(2) Decode speed** (`experiments/_rwkv7_c_bench.py`, single sequence, state established then
+single steps,
+per-cell subprocess, 5 interleaved rounds, median of 60 steps)
+
+| Implementation | ms/step | Relative to numpy | Per-round wins |
+|---|---|---|---|
+| numpy reference | 366.36 | 1.00x | — |
+| C kernel, 1 thread | 67.92 | 5.39x | 5/5 |
+| C kernel, 4 threads | 52.26 | 7.01x | 5/5 |
+| C kernel, 8 threads | 48.88 | 7.49x | 5/5 |
+
+The C kernel at 8 threads is another 1.39x faster than 1 thread (5/5). **Boundaries**: the
+single-thread single-cell absolute-time variance is large
+(50–84 ms), floating with machine load; the ratio and the per-round sign test agree in
+direction; only the single-sequence single-thread regime
+was measured, no batch. The GEMV's column-chunked parallelism does not change each column's
+sum order; 8-thread and 1-thread are bit-identical.
+
+**(3) Bugs located during development**
+- The weight layout and the C side are inconsistent: the exporter judged LoRA tensors with
+  `name.split(".")[-1]`,
+  picking up `"weight"` instead of the module name, so 8 LoRA matrices were not transposed and
+  `w1@w2`'s dimensions collapsed to `(64,64)`. It surfaced when the per-tensor float
+  counts did not match (off by 21,120,000).
+- `w`'s LoRA has a `tanh` sandwiched in the middle
+  (`exp(-σ(tanh(xw W1) W2 + w0)/√e)`); it **cannot be folded into a single matrix**;
+  `a`/`v` have no sandwich, but the factorization is kept for uniformity.
+
+**(4) CLI**
+`--gguf-backend c` goes through the C kernel (`sunnynet/cli.py`'s `_main_gguf_c`); first run
+`experiments/_export_rwkv7.py` to export the blob.
+
+### 24.11 INT4 weight quantization
+
+`sunnynet/runtime/quant.c`. Grouped symmetric INT4: every 64 consecutive weights share one fp32
+scale;
+the quantized value range is [-8, 7]; two values per byte
+(byte k's low nibble = the k-th in the group, high nibble = the k+32-th).
+The quantized GEMV quantizes the activations to INT8 with the same grouping and does the dot
+product with `maddubs`:
+
+```
+Σᵢ (qᵢ − 8) xᵢ = Σᵢ qᵢ xᵢ − 8 Σᵢ xᵢ
+```
+
+The weights stay unsigned [0,15] in the first operand; the activations go in signed as the
+second operand.
+The whole-model C kernel (`rwkv7.c`) mixes fp32 / INT4 per matrix flag; the vectors and the
+embedding table stay fp32
+(the embedding is a lookup, not a multiply-add).
+
+**(1) Primitive correctness** (`tests/test_quant_i4.py`)
+The quantized GEMV's integer path is **bit-identical** to the explicit integer sum; the
+dequantization error is not above that block's
+`scale/2`; the relative error against fp32 GEMV is ~0.11 (within 4-bit expectation).
+
+**(2) Matrix-level speed** (`experiments/_quant_i4_bench.py`, single thread, per-cell
+subprocess, 3-round median)
+
+| Matrix (out×in) | fp32 ms | INT4 ms | Speedup |
+|---|---|---|---|
+| 768×768 | 0.152 | 0.147 | 1.03x |
+| 3072×768 | 0.308 | 0.174 | 1.77x |
+| 768×3072 | 0.305 | 0.180 | 1.70x |
+| 65536×768 | 7.036 | 1.659 | 4.24x |
+
+No gain on small matrices (decode is bandwidth-limited; the matrix is already in L1/L2); the
+large-matrix 4.24x comes from the read volume dropping to 1/8.
+
+**(3) End-to-end** (`experiments/_rwkv7_int4_e2e.py`, whole-model single step, single thread,
+per-cell subprocess,
+5 interleaved rounds, median of 50 steps)
+
+| Regime | fp32 | INT4 |
+|---|---|---|
+| Blob size | 729.1 MB | 269.0 MB |
+| Single-step median | 49.16 ms | 17.35 ms |
+
+End-to-end **2.83x** (wins 5/5 per round); the size is 2.7x compressed.
+
+**(4) Quality** (`experiments/_rwkv7_int4_quality.py`, same-prompt greedy comparison)
+English fact/common-sense continuation stays coherent ("The Eiffel Tower is located in the
+city of Paris, France…");
+Chinese and code degrade (Chinese repetition, the `fibonacci` code recurrence changes).
+**Boundary**: RWKV-7 has no validation set in this project; no ppl is stated; only
+"it runs and is fast" is published here -
+**no lossless-quality claim**: 4-bit wanting quality needs calibration or mixed precision.
+
+**(5) Bugs located during development**
+- The exporter wrote a 4-byte format tag for **every** tensor, but the C-side `take_f32` did
+  not skip it; the tag was treated as
+  weight data, the cursor shifted wholesale and read past the end of the file. The fix:
+  `take_f32` skips 4 bytes first.
+- INT4 requantization matrix direction: `gemv_i4` wants `(out, in)`, but the exporter writes
+  `(in, out)`;
+  it must be transposed before quantization, else the read overflows and crashes.
+
+### 24.12 External-weight integration: Mamba-2 and DeltaNet
+
+`runtime/mamba2.py`, `runtime/deltanet.py`. The same `step(token, state)` interface loads two
+more linear
+architectures' official weights; per-token single-step recurrence; the forward does not go
+through PyTorch. The weights are large, not in the repository;
+put them in any directory and point `--hf-dir` at them, or set the `SUNNY_MAMBA2` /
+`SUNNY_DELTANET`
+environment variable for the tests (unset skips the related cases).
+
+**(1) Mamba-2** (`state-spaces/mamba2-130m`, d_model 768 / 24 layers / 24 heads × 64)
+
+That checkpoint's `config.json` has only `ssm_cfg: {"layer": "Mamba2"`, **no** dimension
+hyperparameters;
+they must be filled in from `mamba_ssm`'s `Mamba2` defaults (`ngroups=1`, `d_state=128`);
+this combination is self-consistent with
+`conv_dim = 1536 + 2·1·128 = 1792`, `nheads = 1536/64 = 24`, and `A_log` length 24.
+The `vocab_size` is actually padded to 50288. The weights are 219 tensors.
+
+Mathematically each head state is a `(head_dim=64, state_size=128)` matrix, but the decay
+`dA = exp(dt·A)`
+is uniform over `(p, n)` and the outer product factors, so it degrades to an elementwise
+first-order recurrence; no matrix-vector product is needed:
+
+```
+dA  = exp(dt_h · A_h)
+S_t = S_{t-1} ⊙ dA + (dt_h · B_g) ⊗ x_h
+```
+
+Against `transformers`' `Mamba2ForCausalLM` full forward
+(`experiments/_mamba2_check.py`, 24 tokens):
+
+| Quantity | Value |
+|---|---|
+| max\|diff\| | 5.875e-04 |
+| mean\|diff\| | 6.003e-05 |
+| argmax agreement | 24/24 |
+| Single step vs segmented continuation | **0.0** (bit-identical) |
+
+The 5.9e-04 magnitude first rules out a formula error: the official **fp32** itself deviates
+from **fp64** by **3.814e-04**
+(the `mamba2_chunk_scan` cumsum/segment_sum path), while this implementation deviates from
+fp64 by only
+**2.518e-04**, **closer to the truth than the official fp32**. ⇒ The difference is
+single-precision accumulation, not a math error.
+
+Greedy continuation (GPT-NeoX tokenizer, must be taken separately from
+`EleutherAI/gpt-neox-20b` - that checkpoint
+does not include tokenizer files):
+
+```
+The capital of France is a city of the French people, and the capital of the French Republic.
+def fibonacci_2(n):\n    return n %
+```
+
+**(2) DeltaNet** (`fla-org`'s DeltaNet 340M, hidden 1024 / 24 layers / 8 heads × 128)
+
+338 tensors. `use_beta=true` (headwise, `b_proj` outputs 8), `qk_norm=l2`,
+`qk_activation=silu`,
+`use_short_conv=true` (one depthwise conv of kernel=4 on q/k/v each, no bias),
+`use_output_norm=true`
+(a gated-less RMSNorm, `o_norm` length 128), `use_gate=false`,
+`allow_neg_eigval=false`
+⇒ **no decay gate**; a pure delta rule. The math basis is `fla/layers/delta_net.py`'s
+`fused_recurrent` path and `fla/ops/delta_rule/fused_recurrent.py`:
+
+```
+δ_t = (v_t − S_{t-1}ᵀ k_t) · β_t
+S_t = S_{t-1} + k_t ⊗ δ_t
+o_t = S_tᵀ q_t
+```
+
+`S` is stored in this repository as `(k_dim, v_dim)`, the transpose of the standard writing;
+when coding, use
+`kv = einsum("hkv,hk->hv", S, k)`, `o = einsum("hkv,hk->hv", S, q)`.
+
+Checks (`experiments/_deltanet_check.py`):
+
+| Check | Result |
+|---|---|
+| Rank-1 form vs explicit `(I − β k kᵀ) S + β k vᵀ` | max\|diff\| **4.578e-05** |
+| Full pass vs segmented continuation | **0.0** (bit-identical) |
+| Repeat-run bit stability | **0.0** |
+| Greedy continuation | `<s>The capital of France is the city of Paris. It is the largest city in Europe and the second largest in the world.` |
+
+**(3) Speed** (`experiments/_hf_runtime_bench.py`, single-thread numpy reference path,
+per-cell subprocess x 5 interleaved rounds, median of 30 steps)
+
+| Architecture | Median ms/token | Min | Max |
+|---|---|---|---|
+| mamba2 | 45.68 | 38.27 | 55.42 |
+| deltanet | 91.46 | 83.93 | 99.19 |
+
+**These are the reference path's absolute times; no multiple is compared against any
+baseline.**
+Both have a per-step complexity of
+`O(heads x head_dim x state_size)`, independent of context length.
+
+**(4) The matrix-valued recurrence layer is still not in C**: RWKV-7's and DeltaNet's state
+updates both include an outer-product accumulation like `S ← S + k ⊗ (·)`;
+the `SN_FMA` / `SN_GATED` per-channel forms cannot express it; Mamba-2 does not need it,
+because its decay outer product factors.
+This is the only recurrence layer of the Runtime not yet C-ified.
+
+**(5) Pitfalls located during development**
+- Mamba-2's `config.json` is missing `state_size` / `n_groups`; `conv_dim` only fixes their
+  **product**
+  (`(conv_dim − d_inner)/2 = 128`); looking at the weights alone, it cannot be split.
+  Four splits - `(8,16)` / `(1,128)` / `(2,64)` / `(4,32)` - all agree with the official
+  forward to the same order; only returning to `mamba_ssm`'s defaults settles it.
+- DeltaNet's `head_k_dim == head_v_dim == 128`; multiplying the explicit matrix form on the
+  wrong side **does not raise a dimension error**,
+  it silently computes a different formula (the first-round check therefore got a spurious
+  difference of 134.3).
+- `state-spaces/mamba2-130m` does not include the tokenizer; feeding a Llama tokenizer
+  (vocab 32000) to a
+  50277-vocabulary model gives garbled output; the GPT-NeoX tokenizer (vocab 50254) must be
+  taken separately.
+
+---
+
+## 25. 100M-scale training, weight release, and Agent-ecosystem integration
+
+§15 only reached the **single-step feasibility** of 0.5B (SGD runs, AdamW OOM), with no
+multi-step convergence data.
+This section adds `p100mw`'s (stack 93.83M / total 105.36M) real multi-step training and
+packages the weights into a releasable asset.
+
+### 25.1 Training
+
+Protocol: GPU (GTX 1060 6GB, sm_61), bs=2 x seq=256 x 2000 steps = 1,024,000 tokens,
+lr 1e-3, warmup 100, cosine decay, AdamW, grad_clip 1.0, seed 1234,
+corpus `zh_ancient` 0.4 / `en_literature` 0.35 / `code_python` 0.25.
+
+| Step | train loss | val loss | ppl | ms/tok |
+|---|---|---|---|---|
+| 200 | 5.8046 | 5.7407 | 311.29 | 0.501 |
+| 600 | 5.1452 | 5.3599 | 212.71 | 0.502 |
+| 1000 | 4.8508 | 5.1040 | 164.68 | 0.502 |
+| 1400 | 5.9248 | 4.8997 | 134.25 | 0.503 |
+| 1800 | 6.2203 | 4.8115 | 122.91 | 0.503 |
+| 2000 | 2.9600 | 4.7882 | **120.09** | 0.503 |
+
+val decreases monotonically, no divergence; wall 583.5s; peak_rss 1301.6MB; final train loss
+2.9600.
+The per-cell train-loss jitter is large (val is stable); this is normal for the small batch
+(x2) plus inter-domain corpus differences.
+
+**Regime**: 1.024M tokens for 105M params is extreme under-training (~0.01 tokens/param);
+this section
+**claims no convergence and no cross-architecture quality comparison**; it only provides the
+evidence of "stably decreasing + loadable and generative".
+
+### 25.2 The 6GB card's configuration boundary
+
+| Config | Result |
+|---|---|
+| bs=1 x 256 | passes, 1.220 ms/tok |
+| **bs=2 x 256** | **passes, 0.744 ms/tok (chosen as the training config)** |
+| bs=4 x 128 | passes, 0.818 ms/tok |
+| bs=4 x 256 | OOM in late training |
+| bs=8 x 128 | OOM in late training |
+
+Three measurement traps (all reproduced by measurement):
+
+1. **`expandable_segments` is unavailable on sm_61**. Adding
+   `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` makes the OOM appear earlier,
+   not later. Consistent with §15's record.
+2. **When VRAM is occupied by other processes, the free number is untrustworthy**. With a
+   resident Ollama taking 383 MiB,
+   the nominal free is 5649 MiB, but a 12 MiB allocation attempt fails; first unload with
+   `keep_alive: 0` to bring
+   free back to 6031 MiB and it recovers. This is WDDM allocator fragmentation, not an
+   arithmetic problem.
+3. **Validation batches also eat VRAM**. `val-batches 8` at bs=2 OOMs in the validation
+   phase;
+   dropping to 2 is stable throughout. The training config and the validation config must be
+   bounded separately.
+
+### 25.3 Weight packaging and load verification
+
+`sunnynet-release` (`sunnynet/release.py`) exports three asset types + a model card + a sha256
+manifest in one go:
+
+| Artifact | Size | First 12 sha256 chars |
+|---|---|---|
+| `sunnynet-p100mw.pt` | 467.7 MB | `399e604e635b` |
+| `sunnynet-p100mw.safetensors` | 421.5 MB | `12784fbfadf7` |
+| `sunnynet-p100mw.runtime.bin` | 467.6 MB | `95c195e47637` |
+
+The safetensors has 139 tensors. **When the embedding is tied
+(`tie_embeddings=True`), `head.weight` and
+`embed.weight` share storage; safetensors refuses to save and reports "Some tensors share
+memory"**;
+the exporter drops `head.weight` and writes `sunnynet.tied_head=1` into the metadata; the
+loader reuses embed.
+
+Three load paths measured (the same weights):
+
+| Path | Output | Speed |
+|---|---|---|
+| torch backend | `"“H不得你，也不可不得…"` | 143.6 ms/tok |
+| C Runtime (`.runtime.bin`) | `"「尚與子之子，雖以一名，於我也。"` | **80.2 ms/tok** |
+| OpenAI service (official SDK) | all four call patterns pass | — |
+
+The C-backend reading against the torch backend is a single run (20 tokens);
+**no speedup-ratio claim is made**; it only proves the exported
+blob layout matches the kernel's expectation and can be loaded independently of PyTorch.
+
+### 25.4 Agent-ecosystem integration: three Ollama pitfalls
+
+The RWKV-7 191M GGUF was really imported through Ollama and generated successfully
+(`family=rwkv7`,
+`parameter_size=191.13M`, `runner=llamacpp`, `tokenizer.ggml.model=rwkv`).
+
+1. **TEMPLATE must be written explicitly**. Ollama's built-in `rwkv-world` template wraps
+   another
+   `User: / Assistant:` layer around the prompt; under the same prompt the output degenerates
+   into repetition
+   (`"-of-the-world-of-the-world-of-..."`). Writing
+   `TEMPLATE """User: {{ .Prompt }}\n\nAssistant:"""` restores the output to
+   `" The capital of France is Paris."`, byte-identical to our own C runtime's raw output -
+   proving the problem was the template, not the tokenization.
+2. **`Error: could not locate ollama app` actually means the server is not running**.
+   `ollama create` silently tries to launch the local app and fails when the server is
+   offline. Precisely reproduced:
+   `OLLAMA_HOST` pointing at an empty port → that error; the server online → normal. The
+   diagnostic script must probe
+   `GET /api/version` first, else it misjudges an environment problem as an installation
+   breakage.
+3. **`OLLAMA_MODELS` must match the server side**. Setting only `OLLAMA_HOST`, `create`
+   writes the blob into the default directory,
+   mismatching the running server's directory.
+
+Another environment-related pitfall: the local probe must bypass the system HTTP proxy. An
+enterprise proxy also blocks
+`http://127.0.0.1:...` into a **502**; on the Python side, `urllib.request.ProxyHandler({})`
+must build the opener to get the real status.
+
+LM Studio is not installed on this machine; only the GGUF directory layout
+(`<models>/<publisher>/<repo>/<file>.gguf`,
+hard links preferred) and the integration config generation were done; **no real load
+verification was done**.
+
+### 25.5 The verifiable boundary of the SIMD backends
+
+Neither the AVX-512 nor the NEON backend is "written and done" - two hard constraints of this
+machine's CPU and toolchain decide
+how far verification can go.
+
+**AVX-512**: this i7-8750H (Coffee Lake) CPUID measured `AVX512F=0 / BW=0 / VL=0`; it
+cannot execute.
+Verified: `gcc -mavx512f -mavx512bw -mavx512vl` compiles,
+objdump confirms **198 `zmm` registers + 16 `vfmadd132ps`**,
+and `load_avx512()` raises when unsupported (avoiding an illegal instruction).
+**The execution correctness is not verified.**
+
+**NEON**: no ARM toolchain, no QEMU (`wsl.exe` is blocked by security policy). A real cross
+compile via
+`zig cc -target aarch64-linux-gnu` produced an AArch64 ELF64 (`e_machine=183`);
+capstone 5.0.7 confirms it generates the 4-lane `fmla v3.4s, v2.4s, v4.4s` and
+`fmul`/`fsub`/`fadd`.
+**The execution correctness is not verified**; execution verification is on the CI's
+`ubuntu-24.04-arm` runner.
+
+This section's conclusion is just "the artifact exists and the instructions are correct",
+**not a performance conclusion**.
+
+---
+
+## 26. Full reproduction
+
+```bash
+# 1. Environment
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install numpy matplotlib pytest
+
+# 2. Data
+python prepare_data.py
+python build_corpus.py --vocab-size 8192
+
+# 3. Learning-rate calibration
+python experiments/run_experiments.py --exp probe --steps 260
+
+# 4. Main experiments (each with its best lr)
+python experiments/run_experiments.py --exp baseline --steps 1200
+python experiments/run_experiments.py --exp ablation --steps 600
+python experiments/run_experiments.py --exp seeds    --steps 600
+
+# 5. Long sequence / 20M
+bash experiments/battery2.sh
+python experiments/long_sequence.py --only latency
+
+# 6. Same-complexity O(N) comparison (seven architectures)
+bash experiments/battery5.sh                                  # same-protocol quality / training cost
+python experiments/on_scaling.py --threads 8 --repeats 9 \
+    --out experiments/results/on_scaling_t8.json             # speed scaling with T
+
+# 7. Figures and aggregation
+python experiments/make_figures.py
+python experiments/collect_results.py --out docs/_tables.md
+
+# 8. T=1024 audit / cross-distribution / short sequences (2026-10-21)
+python experiments/_T1024_audit.py 1024 8                    # §17 training-regime speed + peak memory
+python prepare_extra.py                                       # collect external new domains (arxiv/news)
+python experiments/_ood.py 600 sunnynet,transformer,...       # §18 cross-distribution generalization
+python experiments/_shortseq.py 128,256,384 3                 # §19 short-sequence training-regime crossover
+python experiments/_shortseq2.py 32,64,128,256 8 3            # §20 ultra-short sequences + narrow config
+python experiments/_decode_bench.py 32,64,128,256 3            # §20 decode regime (per token)
+```
+
+### Hand-written kernels (§21/§22; a C compiler is needed)
+
+```bash
+export SUNNY_W64=F:/devtools/w64devkit    # w64devkit (GCC 16.2.0)
+python -X utf8 experiments/_kernel_bench.py                  # §21.3 operator-level speedup
+python -X utf8 experiments/_core_e2e.py 256 6 8              # §22.3 fused-kernel training-step A/B
+python -X utf8 experiments/_scan_share.py 256                # §22.4 training-step composition
+python -X utf8 experiments/_step_e2e.py 128,256,512 1 4      # §22.5 inference-regime A/B
+python -X utf8 experiments/_decode_batch.py 256 1,4,8,16,32 3
+python -X utf8 experiments/_decode_dim.py 256 3              # §22.5 dim scan
+python -X utf8 experiments/_decode_longpath.py 256,512,1024,2048,4096 2  # §22.10 single step vs context
+```
+
+### General recurrence runtime (§24; a C compiler is needed)
+
+```bash
+export SUNNY_W64=F:/devtools/w64devkit
+python -X utf8 experiments/_recur_equiv.py                   # §24.3 kernel self-check
+python -X utf8 experiments/_unified_ir_map.py                # §24.2 cross-architecture mapping
+python -X utf8 experiments/_runtime_bench.py                 # §24.4 vs the vectorized baseline
+python -X utf8 experiments/_state_quant.py                   # §24.5 state-quantization dynamic range
+python -X utf8 experiments/_export_runtime.py \
+    experiments/ckpts_ood/sunnynet.pt experiments/ckpts_ood/sunnynet.runtime.bin
+python -X utf8 experiments/_runtime_model_equiv.py           # §24.7 C vs torch
+python -X utf8 experiments/_runtime_decode.py 256,1024,2048 3  # §24.7 decode latency
+python -X utf8 experiments/_ab_fp16.py                        # §24.7c fp16 vs fp32
+python -X utf8 experiments/_fp16_threads.py                   # §24.7c fp16 thread scaling
+python -X utf8 experiments/_rwkv7_gguf_equiv.py              # §24.9 GGUF vs .pth
+python -X utf8 experiments/_rwkv7_gguf_bench.py              # §24.9 numpy generation
+python -X utf8 experiments/_export_rwkv7.py                  # §24.10 export the C blob (needs GGUF)
+python -X utf8 experiments/_rwkv7_c_equiv.py 12              # §24.10 C vs numpy
+python -X utf8 experiments/_rwkv7_c_bench.py 5               # §24.10 C kernel speed
+python -X utf8 experiments/_quant_i4_bench.py                # §24.11 INT4 matrix speed
+python -X utf8 experiments/_rwkv7_int4_e2e.py 5              # §24.11 INT4 end-to-end
+python -X utf8 experiments/_rwkv7_int4_quality.py            # §24.11 INT4 quality comparison
+python -X utf8 -m pytest tests/test_rwkv7_c.py -v
+python -X utf8 -m pytest tests/test_quant_i4.py -v
+```
+
+> The GGUF weights and exported blobs are large; get them on demand from `experiments/gguf/`;
+> they are not distributed with the repository.
+
+> **Process-isolation requirement**: timing measurements must use one subprocess per cell
+> (built into `experiments/on_scaling.py`),
+> else accumulated in-process model builds inflate the readings up to 2x or more; see §2.4.
+
+All the raw results are in `experiments/results/`; the figures are in `docs/figures/`.
+

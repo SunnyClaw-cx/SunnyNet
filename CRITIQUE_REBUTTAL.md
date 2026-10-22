@@ -122,3 +122,151 @@ mamba 1780 · linear_attn 1777 · h3 1689 · rwkv 1611
 
 数据不支持的表述：任何"全面更快""规模越大越强""长距离强于 Transformer"
 "泛化能力强"（只能说"跨分布不比同行差"）。
+---
+
+# Item-by-item check of external criticisms
+
+Against a set of external criticisms (short-sequence inversion / Scaling Law failure / weak
+long-range retrieval / random datasets / poor multi-seed generalization / slowest at T=1024 with
+the highest memory), each claim is checked against this repository's existing measured data and new
+measurements, and classified as "holds", "does not hold", or "insufficient evidence".
+
+New scripts and data: `experiments/_T1024_audit.py`, `prepare_extra.py`, `experiments/_ood.py`.
+
+---
+
+## 1. Item-by-item verdicts
+
+| Criticism | Verdict | Evidence |
+|---|---|---|
+| Slower than Transformer below T=384 | Holds, but only in the batch=1 forward pass regime | §2.4 crossover T≈384; in the training regime (batch=8) the crossover drops to T<256 (§19) |
+| Therefore it is limited to common NLP tasks | Does not hold (wrong premise) | Short-text classification / dialogue response belong to the training/fine-tuning regime; training-regime T=256/384 is already 1.5-2.4x faster (§19) |
+| Scaling Law failure | Insufficient evidence | This repository measured only two points, 20M / 100M (§14.6 / §14.8); there is no scaling curve, so "failure" cannot be judged |
+| Weak long-range retrieval | Does not hold for the code domain, holds for natural language | §8: code-domain far-bucket hit rate 0.1208, on par with Transformer; natural-language domain is near 0 |
+| Measured on random datasets | Holds only for the speed benchmarks, not for the quality claims | Speed scripts use `torch.randint` (computation graph and values are independent); the quality comparison runs on `DomainMixer` -> real token stream (§3/§10/§12) |
+| Large multi-seed variance | Holds, and is known to the project | §6: seed ppl range 6.32 > architecture gap 3.53; §10.5 already states that a single seed cannot be the basis of a verdict |
+| Poor cross-dataset generalization | Does not hold | 1st/7 on the new Chinese domain, 2nd/7 on the new English domain, lowest OOD drop of the group (§18) |
+| Slowest at T=1024 | Depends on the premise: in the batch=1 forward pass it ranks 5th (not the slowest - Transformer is last); in the training regime it ranks 1st | §10.6 / §17 |
+| Highest peak memory at T=1024 | Does not hold | §17: SunnyNet 1812 MB ranks 2nd-lowest, 43% less than Transformer |
+
+---
+
+## 2. T=1024 training-regime speed and memory (§17)
+
+The existing `on_scaling_t8.json` only has batch=1 pure forward passes, and memory was never
+recorded. Training regime added:
+
+Speed (ms/token): sunnynet **0.13186 (1st)** / h3 0.13190 / mamba 0.14721 /
+hyena 0.16754 / linear_attn 0.17646 / rwkv 0.19677 / transformer 0.55693
+
+Peak memory (MB): transformer 3192 / **sunnynet 1812 (2nd)** / hyena 1809 /
+mamba 1780 / linear_attn 1777 / h3 1689 / rwkv 1611
+
+=> In the training regime both accusations do not hold. Forward-pass and training-regime rankings
+differ (backward is 56.9% of the training step, §13.3).
+
+---
+
+## 3. Training-regime check of the short-sequence inversion (§19)
+
+Re-measured three configurations x three lengths x 3 rounds in the training regime
+(batch=8, including backward):
+
+| Configuration | T=128 | T=256 | T=384 |
+|---|---|---|---|
+| `small` (old d128) ratio to TF | 1.104 | 0.672 | 0.581 |
+| `smalln80` (narrow, §16) ratio to TF | 1.045 | 0.509 | 0.425 |
+
+(ratio < 1 = faster than Transformer)
+
+- The crossover drops from T≈384 (forward) to T<256 (training regime): already 1.5-2.4x faster at
+  T=256/384.
+- T=128 is still slower: old configuration 10.4%, narrow configuration 4.5% (inside the
+  high-memory-pressure noise band).
+- The effective remedy is reducing activation width (narrow residual stream): the T=128
+  disadvantage narrows from 10.4% to 4.5%, T=256/384 speed up 24-27%. Widening or adjusting batch
+  does not help (§16.5/§13.3: the root cause is operator count).
+
+---
+
+## 4. Cross-distribution (OOD) generalization
+
+Method: train 600 steps on the original three domains
+(zh_ancient/en_literature/code_python), measure ppl on external new datasets that never appeared
+during training.
+
+New datasets (`prepare_extra.py`, collected independently, not splits of the original corpus):
+- `arxiv_en`: 500 English science abstracts from the arxiv API, 236,595 tokens
+- `zh_tech_news`: 97 tech/science articles from Xinhua / Guangming / People's Daily, 164,711
+  tokens
+
+Fairness premise: the BPE vocabulary comes from traditional-script ancient texts, so
+`zh_tech_news` has a 23.02% out-of-vocabulary character rate (many simplified characters fall
+outside the table), while `arxiv_en` has only 0.05%. The high ppl of the new Chinese domain
+includes a tokenizer-mismatch component, not purely distribution shift, so the two are reported
+separately rather than merged into one ratio.
+
+### Results (lower ppl is better; 600 steps, single seed, T=1024)
+
+| Architecture | arxiv_en (new) | zh_tech_news (new) | ext/orig drop |
+|---|---|---|---|
+| **sunnynet** | **35.58 (2nd)** | **321.08 (1st)** | **1.480** |
+| h3 | 31.52 (1st) | 446.77 (4th) | 1.840 |
+| rwkv | 41.03 (4th) | 427.22 (3rd) | 1.691 |
+| mamba | 40.87 (3rd) | 499.74 (6th) | 1.964 |
+| hyena | 54.22 (5th) | 400.39 (2nd) | 1.481 |
+| linear_attn | 61.55 (7th) | 489.23 (5th) | 1.694 |
+| transformer | 61.34 (6th) | 531.77 (7th) | 1.817 |
+
+### Reading
+
+- "Poor cross-dataset generalization" does not hold: in the new Chinese domain SunnyNet is 1st/7
+  (that domain puts it under the unfavorable condition of 23% unk); 2nd/7 on the new English
+  domain; OOD drop 1.480, the lowest of the seven architectures (tied with hyena).
+- Regime trap: the "same-domain" ppl of `zh_ancient` is the highest on every architecture
+  (sunnynet 326, transformer 424), because 600 steps is unconverged plus that domain
+  (traditional-script ancient texts) is the hardest. Using it as a denominator distorts ratios -
+  `sunnynet`'s `news/zh_anc=0.985` looks like "no drop" but is an inflated denominator; it cannot
+  be read as "cross-domain is better than same-domain". The only reliable metric is
+  `arxiv_en/en_literature`: sunny 1.706, in the same band as h3 1.686 / hyena 1.691.
+- Nor can one reverse the claim to "strong generalization": absolute ppl is still high, 600 steps
+  is unconverged, single seed.
+  The only reliable conclusion: cross-distribution is no worse than same-complexity peers.
+
+(Data in `experiments/results/_ood.json`.)
+
+---
+
+## 5. Two places where the critics get the conclusion right but the cause wrong
+
+1. "Short-sequence inversion limits common NLP applications": direction right, but the premise is
+   forward-pass latency.
+   In the training regime T=256 already ties rwkv (§16), and §16.5 already proved the tie holds
+   only at L=4 - when layer counts are aligned to L=6 the same-budget narrow configuration is
+   30-40% slower, and the root cause is operator count rather than FLOPs.
+   The correct remedy is reducing operator count (fusion / fewer layers), not widening or
+   adjusting batch.
+
+2. "Scaling Law failure": the claim has no data support in the report -
+   this repository measured only two points, 20M / 100M; the TL;DR explicitly says "the scaling
+   trend is not monotonic", which itself shows that no scaling curve has been established, so
+   "failure" cannot even be discussed. A verdict requires adding at least 4 more scale points.
+
+---
+
+## 6. Conclusions
+
+- Holds: short-sequence forward inversion below T=384 (measured, structural); large seed variance
+  (known); near-zero natural-language long-range retrieval (measured).
+- Does not hold: poor cross-dataset generalization (OOD measured 1st on new Chinese, 2nd on new
+  English, lowest drop); T=1024 training-regime "slowest + highest memory"; "quality measured on
+  random data" (quality uses real corpus); "weak long-range retrieval in the code domain" (ties
+  Transformer).
+- Insufficient evidence: Scaling Law failure (this repository has no scaling curve, only the
+  20M/100M two points).
+- Added: T=1024 training-regime audit (§17); OOD cross-domain measurement (§18, refutes
+  "poor generalization").
+
+Claims the data does not support: any "faster across the board", "larger is stronger",
+"long-range retrieval stronger than Transformer", "strong generalization"
+(can only say "cross-distribution no worse than peers").

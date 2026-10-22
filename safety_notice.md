@@ -28,3 +28,45 @@
 ## 4. 使用者的义务
 
 下载或使用本仓库任何内容，即表示你已阅读、理解并接受上述全部限制。
+---
+
+# Safety and Usage Notice
+
+**SunnyNet is an experimental research project, not a product, and it has not gone through any
+safety alignment process.**
+
+## 1. General limitations
+
+- The model is a small-scale prototype trained from scratch with limited data volume; its outputs
+  are **not guaranteed to be factually correct** and carry the risks of generating false
+  information, repetitions, grammatical errors, logical contradictions, and harmful content.
+- The model **has not undergone instruction fine-tuning or human-feedback alignment** and does not
+  have reliable instruction-following ability; it must not serve as the basis of any production or
+  decision-making system.
+- Any consequences arising from the use of the model's outputs are borne by the user.
+
+## 2. Medical content (important)
+
+- This repository includes corpus from the "traditional Chinese medicine" domain (sourced from
+  Project Gutenberg's publicly available Chinese classical literature).
+  **These texts were written hundreds to thousands of years ago, and their medical claims have
+  not been validated by modern medicine.**
+- The model's outputs on traditional Chinese medicine texts are **purely linguistic results of
+  language modeling; they do not constitute medical advice, a basis for diagnosis, or a basis for
+  prescription in any way**.
+- **For any health concerns, consult a licensed medical professional. Do not self-diagnose,
+  self-medicate, or make any medical decision based on this model's outputs.**
+
+## 3. Legal and compliance
+
+- Users are responsible for ensuring that their usage complies with the laws and regulations of
+  their jurisdiction.
+- This model must not be used to generate illegal content, misinformation, or content that
+  infringes on others' rights.
+- This model must not be used for any face / voice-print / identity-related purpose without
+  explicitly informing the persons concerned.
+
+## 4. The user's obligations
+
+By downloading or using any content of this repository, you confirm that you have read,
+understood, and accepted all of the above limitations.

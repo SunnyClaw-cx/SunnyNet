@@ -42,3 +42,59 @@
 - 验证：干净副本 54 passed · `bare pytest tests/` 54 passed · smoke 2 passed · 3.12 `compileall` 无错
 - 结果：推送后官方 badge `failing → passing`（首次全绿）
 - 当前测试数已增至架构 59 项 + 冒烟 2 项，仍全绿。
+---
+
+# Repository gap audit
+
+Conclusions come from measurements against the API / filesystem / a clean copy, not from
+inference.
+Clean copy = `git archive HEAD | tar -x` (equivalent to a CI checkout, no `data/` directory).
+
+## 1. Item-by-item verdicts
+
+| # | Audit-table claim | Verification result (evidence) | Verdict |
+|---|---|---|---|
+| 1 | 0 Releases / 0 Tags | `api.github.com/.../tags` -> `[]`; `/releases` -> `[]` | True |
+| 2 | No CONTRIBUTING | `.github/` contains only `FUNDING.yml` + `workflows/tests.yml`; no CONTRIBUTING / CODE_OF_CONDUCT / SECURITY / issue / PR templates at all | True |
+| 3 | No sample data | `git ls-tree -r HEAD` 219 files, zero `.bin`/`.csv`/`.pt`; `data/` is in `.gitignore` | True |
+| 4 | No pretrained weights | Same as above, no weight files of any kind | True |
+| 5 | Zero external validation | `contributors` = `sunny-cx` (20 commits) + `SunnyClaw-cx` (3 commits); both accounts' `name`/`bio` point to the same person | True |
+| 6 | No GPU / no public benchmarks | Report §15 is entirely GPU measurements: GTX 1060 forward 8.0-15.2x, training step 9.9-12.5x, and it explicitly states there is no GPU-side peer comparison | False |
+| 7 | Comparison baselines are self-written | `sunnynet/linear_baselines.py` is indeed a hand-written implementation | True, but not a gap |
+| 8 | README has no CI badge | README has only 1 `shields.io` badge (afdian sponsor) | True |
+| 9 | CI is green | All 17 CI runs are FAILURE, it has never succeeded in history; the badge was measured as `failing` at the time | Complete opposite -> fixed |
+
+## 2. The two most important points in the table
+
+- The one with the direction reversed is the real defect: the table claims "CI is green", but
+  measurement shows 17/17 all red.
+  A fully green local test suite masks it - locally `data/proc/tokenizer.json` exists, but a CI
+  checkout does not.
+- The two that look most alarming turn out to be false: #6 has GPU verification (just no peer
+  comparison);
+  #7 hand-written baselines are the standard practice for architecture research (peers' official
+  implementations can be reused only when they have a paper, and the "no implementation
+  degradation" rule requires writing your own).
+
+## 3. Items missing from the table (should be filled before promotion)
+
+| Item | Evidence | Impact |
+|---|---|---|
+| Zero GitHub topics | `api.github.com/.../topics` -> `names: []` | Directly hurts discoverability; top priority before promotion |
+| No dependency declaration | `pyproject.toml`/`setup.py`/`requirements.txt` all absent | Installation experience; the version number `0.1.0` only exists in `sunnynet/__init__.py` |
+| Discussions not enabled | `has_discussions: false` | Missing entry point for community hosting |
+
+## 4. Fixed and verified
+
+Root cause: `train/train.py` and `train/evaluate.py` hard-coded `ROOT/"data"/"proc"/"tokenizer.json"`,
+bypassing `build_corpus.PROC`, which structurally broke the tests'
+`monkeypatch.setattr(build_corpus,"PROC",...)`.
+
+- Clean-copy reproduction: `2 failed, 52 passed`
+  (`FileNotFoundError` at `test_smoke_pipeline.py:102`)
+- Fix: switch to the existing `build_corpus.load_tokenizer()`; the `smoke-train` job additionally
+  installs `pytest`
+- Verification: clean copy 54 passed / bare `pytest tests/` 54 passed / smoke 2 passed / 3.12
+  `compileall` no errors
+- Result: after pushing, the official badge went `failing -> passing` (first fully green)
+- The current test count has grown to 59 architecture items + 2 smoke items, still fully green.
