@@ -1,0 +1,15 @@
+{
+ "id": "kitastro/sunnynet-proto20m-big-data-run",
+ "title": "SunnyNet proto20m big data run",
+ "code_file": "sunnynet_bigdata.py",
+ "language": "python",
+ "kernel_type": "script",
+ "is_private": true,
+ "enable_gpu": true,
+ "enable_internet": true,
+ "machine_shape": "Gpu",
+ "dataset_sources": [],
+ "competition_sources": [],
+ "kernel_sources": [],
+ "model_sources": []
+}

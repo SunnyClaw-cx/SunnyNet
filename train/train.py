@@ -202,6 +202,8 @@ def main():
     ap.add_argument("--ablation", type=str, default="", help="如 decay_gate=0,circulant=0")
     ap.add_argument("--mix", type=str, default="")
     ap.add_argument("--save-ckpt", type=str, default="")
+    ap.add_argument("--save-every", type=int, default=0,
+                    help="里程碑 checkpoint 间隔步数 (0=关闭)")
     ap.add_argument("--device", type=str, default="cpu",
                     help="cpu 或 cuda (GPU 仅用于规模化训练, 结论不混 CPU 速度口径)")
     args = ap.parse_args()
@@ -315,6 +317,15 @@ def main():
                                            if perf.mean_page_faults is not None else None),
                    "elapsed_s": round(t_eval, 2)}
             log["history"].append(rec)
+            if args.save_every > 0 and args.save_ckpt and (step + 1) % args.save_every == 0:
+                sp = Path(args.save_ckpt).with_name(
+                    Path(args.save_ckpt).stem + f"_{step+1:06d}" + Path(args.save_ckpt).suffix)
+                sp.parent.mkdir(parents=True, exist_ok=True)
+                sd2 = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+                torch.save({"arch": args.arch, "model": sd2,
+                            "config": cfg.__dict__ if hasattr(cfg, "__dict__") else cfg,
+                            "summary": {"step": step + 1, "val_loss": rec["val_loss"]}}, sp)
+                print(f"    里程碑 checkpoint -> {sp}")
             print(f"  step {step+1:5d} loss={rec['train_loss']:.4f} val={rec['val_loss']:.4f} "
                   f"ppl={rec['ppl']:.2f} {rec['ms_per_token']:.3f} ms/tok "
                   f"gn={gn:.3f} rss={rec['peak_rss_mb']:.0f}MB "

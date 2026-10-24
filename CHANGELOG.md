@@ -1,5 +1,26 @@
 # Changelog
 
+## 未发布
+
+### 训练里程碑 checkpoint + 语料/代码扩充
+- `train/train.py` 新增 `--save-every N`（默认 0 关闭）：每 N 步在
+  `--save-ckpt` 旁另存 `<stem>_<step>.pt` 里程碑 checkpoint，便于长跑采样
+  与断点观察；保存前 `mkdir(parents=True)`，克隆环境无 `runs/` 也能跑。
+- `fetch_books.py`（新增）：经 gutendex API 抓下载量最高的公开领域英文书
+  （`download_count` 排序），按 `prepare_data` 的分域/清洗口径写入
+  `en_literature`，输出字节兼容；替代原先 13 本固定经典书目，语料多样性大增。
+- `fetch_code.py`（新增）：抓 numpy / flask / requests / urllib3 四个库的
+  `.py` 源码（tarball + `clean_code`）补入 `code_python`，代码域不再只有
+  TheAlgorithms 一个来源。
+- `kaggle/`（新增/更新）：三个自包含 Kaggle 训练内核 ——
+  `sunnynet_p100.py`（p100m 94M 英文散文）、`code_mix/`（94M 70/30 散文+代码）、
+  `big_data/`（proto20m 21M 大语料 1000 本、seq 1024，冲 ~12 tokens/param）。
+  各内核 base64 内嵌取数脚本、按 epoch 估算步数、VRAM 自探 batch、结果写
+  `/kaggle/output`；`kaggle/README.md` 说明用法。
+- `docs/MODEL_SHOWCASE.md`（新增）：2026-10-24 一次会话训练的 7 个模型逐一
+  展示（参数/硬件/步数/token 数/最佳 val + 真实生成样例），并给出
+  tokens/param 这一贯穿结论与「流畅≠连贯」的读数。
+
 ## v0.3.0
 
 ### 层数扩展的代价机制与新预设

@@ -1,23 +1,22 @@
-"""SunnyNet on Kaggle: one big English training run with milestone sampling.
+"""SunnyNet on Kaggle: diverse-English p100m run with milestone sampling.
+
+v4 design: the model was fine; the *data* was the bottleneck. v3 trained 5.5
+epochs over 35 classics (word-soup, low val-ppl that measured fit-to-35-books).
+v4 pulls ~200 diverse public-domain English books from gutendex (~40-60M unique
+tokens) and trains ~1.5 epochs, so it learns *language* instead of memorising a
+handful of novels.
 
 Usage:
-  1. Kaggle -> New Notebook (Python), set accelerator = GPU P100 16GB (or V100/T4 16GB).
-  2. Paste this file into the notebook (each section is one cell-compatible block,
-     or just run it as a whole script).
-  3. GPU free tier: 30h/week, 9h/day - the training run below fits in one session.
-
-What it does:
-  clone repo -> patch train.py (--save-every milestone checkpoints)
-  -> collect corpus (curated EN classics + Python code) -> build BPE tokens
-  -> smoke test (60 steps, CUDA) -> probe batch size -> train p100m
-  -> sample milestones so you can watch prose become coherent.
-
-Everything is plain torch - no prebuilt C kernel, no pip install on GPU.
+  1. Kaggle -> New Notebook, accelerator = GPU P100 16GB (free tier 30h/week).
+  2. Paste this file (self-contained: the gutendex fetcher is embedded base64).
+  3. Results (milestone samples + val history + ckpt copies) -> /kaggle/output.
 """
 
 from __future__ import annotations
 
+import base64
 import json
+import math
 import subprocess
 import sys
 import textwrap
@@ -28,12 +27,13 @@ REPO_URL = "https://github.com/SunnyClaw-cx/SunnyNet"  # edit to your fork if ne
 REPO_DIR = "/kaggle/working/SunnyNet"
 
 PRESET = "p100m"  # ~94M compute-stack params (report's main preset)
-STEPS = 24_000  # ~98M tokens at batch 8 ~= 0.96 tokens/param, ~7h on a P100 (9h cap, no resume)
+EPOCHS = 1.5  # train ~1.5 epochs over the *diverse* corpus
+MAX_STEPS = 27_000  # hard cap so the run stays inside the 9h P100 budget
 BATCH_CANDIDATES = (8, 4, 2)  # probe from largest down until forward+backward fits
 SEQ_LEN = 512
 MIX = "en_literature=1.0"  # stage 1 = coherent English prose
-SAVE_EVERY = 2_000  # milestone checkpoints every N steps (12 + final)
-VAL_EVERY = 500  # 48 val checks total - keeps the run fast
+SAVE_EVERY = 2_000  # milestone checkpoints every N steps
+VAL_EVERY = 500  # ~54 val checks at 27k steps
 NO_EARLY_STOP = True
 
 VOCAB = 8192
@@ -42,8 +42,11 @@ PRESET_DIMS = {  # mirrors _preset_cfg in train/train.py (p100m/p100mw have no s
     "p100mw": {"dim": 1408, "inner": 1920, "rank": 1024, "layers": 8, "h_max": 16384.0},
     "proto20m": {"dim": 512, "inner": 896, "rank": 320, "layers": 10, "h_max": 8192.0},
 }
-# 22 extra curated classics (verified via Gutenberg search; deduped against the
-# repo's built-in EXTRA_EN_BOOKS, which adds 13 more public-domain EN titles).
+# Diverse EN corpus: most-downloaded public-domain books from gutendex.
+GUTENDEX_PAGES = 7  # server caps ~32/page -> ~220 candidates
+GUTENDEX_TOP = 200  # fetch the most-downloaded N of the candidates
+MIN_BOOKS = 80  # fall back to curated classics if the fetch is this thin
+# Fallback curated classics (verified via Gutenberg search; used only if gutendex is thin).
 EXTRA_BOOKS = [
     15,
     2852,
@@ -79,6 +82,10 @@ SAMPLE_PROMPTS = [
 OUT_DIR = Path("/kaggle/output") if Path("/kaggle").exists() else Path("kaggle_out")
 # ==============================================================================
 
+# Self-contained gutendex fetcher (repo-root fetch_books.py). Decoded into the
+# cloned repo at runtime so the kernel stays a single paste-able file.
+FETCH_BOOKS_B64 = "IiIiRGl2ZXJzZSBwdWJsaWMtZG9tYWluIEVuZ2xpc2ggYm9vayBjb3JwdXMgdmlhIHRoZSBndXRlbmRleCBBUEkuCgpTdXBwbGVtZW50cyBwcmVwYXJlX2RhdGEncyBmaXhlZCAxMyBjbGFzc2ljcyB3aXRoIHRoZSBtb3N0LXJlYWQgRW5nbGlzaCBib29rcwpvbiBQcm9qZWN0IEd1dGVuYmVyZyAocmFua2VkIGJ5IGRvd25sb2FkX2NvdW50KSwgc28gdGhlIEVOIHRyYWluaW5nIGNvcnB1cyBpcwpsYXJnZSBhbmQgKmRpdmVyc2UqIGluc3RlYWQgb2YgYSBoYW5kZnVsIG9mIHJlcGVhdGVkIG5vdmVscy4gUmV1c2VzCnByZXBhcmVfZGF0YSdzIGZldGNoL2RlY29kZS9jbGVhbi9zYXZlIHNvIG91dHB1dCBpcyBieXRlLWNvbXBhdGlibGUuCiIiIgoKZnJvbSBfX2Z1dHVyZV9fIGltcG9ydCBhbm5vdGF0aW9ucwoKaW1wb3J0IGFyZ3BhcnNlCmltcG9ydCBqc29uCmltcG9ydCB1cmxsaWIuZXJyb3IKaW1wb3J0IHVybGxpYi5yZXF1ZXN0CmZyb20gY29uY3VycmVudC5mdXR1cmVzIGltcG9ydCBUaHJlYWRQb29sRXhlY3V0b3IsIGFzX2NvbXBsZXRlZAoKaW1wb3J0IHByZXBhcmVfZGF0YSBhcyBwZAoKVUEgPSB7IlVzZXItQWdlbnQiOiAiTW96aWxsYS81LjAgKHN1bm55bmV0LWNvcnB1cykifQpHVVRFTkRFWCA9ICJodHRwczovL2d1dGVuZGV4LmNvbS9ib29rcy8/bGFuZ3VhZ2VzPWVuJnBlcl9wYWdlPXtwZXJfcGFnZX0mcGFnZT17cGFnZX0iCgoKZGVmIGd1dGVuZGV4X2Jvb2tzKHBlcl9wYWdlOiBpbnQgPSAxMDAsIHBhZ2VzOiBpbnQgPSA1KSAtPiBsaXN0W2RpY3RdOgogICAgb3V0OiBsaXN0W2RpY3RdID0gW10KICAgIGZvciBwIGluIHJhbmdlKDEsIHBhZ2VzICsgMSk6CiAgICAgICAgdXJsID0gR1VURU5ERVguZm9ybWF0KHBlcl9wYWdlPXBlcl9wYWdlLCBwYWdlPXApCiAgICAgICAgdHJ5OgogICAgICAgICAgICBkID0ganNvbi5sb2FkcygKICAgICAgICAgICAgICAgIHVybGxpYi5yZXF1ZXN0LnVybG9wZW4oCiAgICAgICAgICAgICAgICAgICAgdXJsbGliLnJlcXVlc3QuUmVxdWVzdCh1cmwsIGhlYWRlcnM9VUEpLCB0aW1lb3V0PTkwCiAgICAgICAgICAgICAgICApLnJlYWQoKQogICAgICAgICAgICApCiAgICAgICAgICAgIG91dCArPSBkLmdldCgicmVzdWx0cyIsIFtdKQogICAgICAgIGV4Y2VwdCAodXJsbGliLmVycm9yLlVSTEVycm9yLCBqc29uLkpTT05EZWNvZGVFcnJvciwgVGltZW91dEVycm9yKSBhcyBlOgogICAgICAgICAgICAjIGtlZXAgZ29pbmcgLSBvbmUgc2xvdyBwYWdlIHNob3VsZG4ndCBzaW5rIHRoZSBydW4KICAgICAgICAgICAgcHJpbnQoZiIgIFtwYWdlIHtwfV0gRVJSIHtlfSIpCiAgICByZXR1cm4gb3V0CgoKZGVmIGdyYWIoYjogZGljdCkgLT4gdHVwbGVbaW50LCBzdHJdIHwgTm9uZToKICAgIHVybCA9IGIuZ2V0KCJmb3JtYXRzIiwge30pLmdldCgidGV4dC9wbGFpbjsgY2hhcnNldD11dGYtOCIpCiAgICBpZiBub3QgdXJsOgogICAgICAgIHJldHVybiBOb25lCiAgICBkYXRhID0gcGQuZmV0Y2godXJsLCB0aW1lb3V0PTkwKQogICAgaWYgbm90IGRhdGEgb3IgbGVuKGRhdGEpIDwgMjAwMDoKICAgICAgICByZXR1cm4gTm9uZQogICAgdCA9IHBkLmRlY29kZV9hbnkoZGF0YSkKICAgIHJldHVybiAoYlsiaWQiXSwgdCkgaWYgdCBlbHNlIE5vbmUKCgpkZWYgbWFpbigpIC0+IGludDoKICAgIGFwID0gYXJncGFyc2UuQXJndW1lbnRQYXJzZXIoKQogICAgYXAuYWRkX2FyZ3VtZW50KAogICAgICAgICItLXRvcCIsIHR5cGU9aW50LCBkZWZhdWx0PTMwMCwgaGVscD0i5Y+WIGRvd25sb2FkX2NvdW50IOacgOmrmOeahCBOIOacrCIKICAgICkKICAgIGFwLmFkZF9hcmd1bWVudCgiLS1wYWdlcyIsIHR5cGU9aW50LCBkZWZhdWx0PTUsIGhlbHA9Imd1dGVuZGV4IOe/u+mhteaVsCAo5q+P6aG1IDEwMCkiKQogICAgYXAuYWRkX2FyZ3VtZW50KCItLXdvcmtlcnMiLCB0eXBlPWludCwgZGVmYXVsdD04KQogICAgYXJncyA9IGFwLnBhcnNlX2FyZ3MoKQoKICAgIHByaW50KGYiW2d1dGVuZGV4XSDmipPlj5YgRU4g5Lmm55uuIChwYWdlcz17YXJncy5wYWdlc30pIC4uLiIpCiAgICBib29rcyA9IGd1dGVuZGV4X2Jvb2tzKHBhZ2VzPWFyZ3MucGFnZXMpCiAgICBib29rcyA9IFtiIGZvciBiIGluIGJvb2tzIGlmIG5vdCBiLmdldCgiY29weXJpZ2h0IildCiAgICBib29rcy5zb3J0KGtleT1sYW1iZGEgYjogYi5nZXQoImRvd25sb2FkX2NvdW50IiwgMCksIHJldmVyc2U9VHJ1ZSkKICAgIHRvcCA9IGJvb2tzWzogYXJncy50b3BdCiAgICBwcmludChmIiAg5YCZ6YCJIHtsZW4oYm9va3MpfSDmnKzlhazlvIDpoobln5/oi7HmlofkuaYsIOWPluS4i+i9vemHj+acgOmrmOeahCB7bGVuKHRvcCl9IOacrCIpCgogICAgc3RhdHMgPSB7InpoX2FuY2llbnQiOiAwLCAiZW5fbGl0ZXJhdHVyZSI6IDAsICJkcm9wIjogMH0KICAgIGNoYXJzID0geyJ6aF9hbmNpZW50IjogMCwgImVuX2xpdGVyYXR1cmUiOiAwfQogICAgd2l0aCBUaHJlYWRQb29sRXhlY3V0b3IoYXJncy53b3JrZXJzKSBhcyBleDoKICAgICAgICBmdXRzID0ge2V4LnN1Ym1pdChncmFiLCBiKTogYiBmb3IgYiBpbiB0b3B9CiAgICAgICAgZm9yIGksIGYgaW4gZW51bWVyYXRlKGFzX2NvbXBsZXRlZChmdXRzKSwgMSk6CiAgICAgICAgICAgIHIgPSBmLnJlc3VsdCgpCiAgICAgICAgICAgIGlmIHIgaXMgTm9uZToKICAgICAgICAgICAgICAgIHN0YXRzWyJkcm9wIl0gKz0gMQogICAgICAgICAgICBlbHNlOgogICAgICAgICAgICAgICAgYmlkLCByYXcgPSByCiAgICAgICAgICAgICAgICBib2R5ID0gcGQuc3RyaXBfYm9pbGVycGxhdGUocmF3KQogICAgICAgICAgICAgICAgZG9tID0gcGQuY2xhc3NpZnkoYm9keSkKICAgICAgICAgICAgICAgIGlmIGRvbSA9PSAiZHJvcCI6CiAgICAgICAgICAgICAgICAgICAgc3RhdHNbImRyb3AiXSArPSAxCiAgICAgICAgICAgICAgICAgICAgY29udGludWUKICAgICAgICAgICAgICAgIGJvZHkgPSBwZC5jbGVhbl96aChib2R5KSBpZiBkb20gPT0gInpoX2FuY2llbnQiIGVsc2UgcGQuY2xlYW5fZW4oYm9keSkKICAgICAgICAgICAgICAgIGlmIGxlbihib2R5KSA8IDgwMDA6CiAgICAgICAgICAgICAgICAgICAgc3RhdHNbImRyb3AiXSArPSAxCiAgICAgICAgICAgICAgICAgICAgY29udGludWUKICAgICAgICAgICAgICAgIGNoYXJzW2RvbV0gKz0gcGQuc2F2ZShkb20sIGYiZ3V0ZW5kZXhfe2JpZH0udHh0IiwgYm9keSkKICAgICAgICAgICAgICAgIHN0YXRzW2RvbV0gKz0gMQogICAgICAgICAgICBpZiBpICUgNTAgPT0gMDoKICAgICAgICAgICAgICAgIHByaW50KAogICAgICAgICAgICAgICAgICAgIGYiICAuLi57aX0ve2xlbih0b3ApfSAgZW49e3N0YXRzWydlbl9saXRlcmF0dXJlJ119IGRyb3A9e3N0YXRzWydkcm9wJ119IgogICAgICAgICAgICAgICAgKQoKICAgIHByaW50KCIgIOWIhuWfn+e7k+aenDoiLCBzdGF0cykKICAgIHByaW50KCIgIOWtl+espuaVsDoiLCB7azogZiJ7djosfSIgZm9yIGssIHYgaW4gY2hhcnMuaXRlbXMoKX0pCiAgICByZXR1cm4gMAoKCmlmIF9fbmFtZV9fID09ICJfX21haW5fXyI6CiAgICByYWlzZSBTeXN0ZW1FeGl0KG1haW4oKSkK"
+
 
 def sh(cmd: list[str], cwd: str | None = None, timeout: int = 3600) -> None:
     print(f"$ {' '.join(cmd)}")
@@ -94,13 +101,36 @@ def sh(cmd: list[str], cwd: str | None = None, timeout: int = 3600) -> None:
 def run_capture(
     cmd: list[str], cwd: str | None = None, timeout: int = 3600
 ) -> tuple[int, str, str]:
-    """Like sh() but never exits - sampling must not kill the run."""
+    """Like sh() but never exits - fetch/sampling must not kill the run."""
     print(f"$ {' '.join(cmd)}")
     r = subprocess.run(
         cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False
     )
     print(r.stdout[-3000:])
     return r.returncode, r.stdout, r.stderr
+
+
+def write_fetch_books() -> None:
+    code = base64.b64decode(FETCH_BOOKS_B64)
+    (Path(REPO_DIR) / "fetch_books.py").write_bytes(code)
+    print(f"  wrote fetch_books.py ({len(code)} bytes)")
+
+
+def estimate_steps(bs: int) -> int:
+    """~EPOCHS passes over the measured EN corpus, capped to the GPU budget."""
+    man = json.loads(
+        (Path(REPO_DIR, "data", "proc", "manifest.json")).read_text(encoding="utf-8")
+    )
+    en = man.get("domains", {}).get("en_literature", {}).get("train_tokens", 0)
+    per_step = bs * SEQ_LEN
+    want = math.ceil(en * EPOCHS / max(1, per_step))
+    steps = min(want, MAX_STEPS)
+    eff = steps * per_step / max(1, en)
+    print(
+        f"  EN tokens={en:,} -> {want} steps for {EPOCHS} epochs; "
+        f"using {steps} (~{eff:.2f} epochs, cap {MAX_STEPS})"
+    )
+    return steps
 
 
 def main() -> None:
@@ -150,17 +180,34 @@ def main() -> None:
         train.write_text(src, encoding="utf-8")
         print("  patched train.py (+save-every)")
 
-    # ---- 3. corpus: curated EN classics + Python code -------------------------
+    # ---- 3. corpus: diverse EN books (gutendex) + Python code -----------------
     print("== [3/6] corpus ==")
+    write_fetch_books()
     sh([sys.executable, "prepare_data.py", "--only-code"], cwd=REPO_DIR)
-    sh(
+    rc, _, _ = run_capture(
         [
             sys.executable,
-            "-c",
-            f"import prepare_data as pd; s,c=pd.collect_books({EXTRA_BOOKS}, 8); print(s); print(c)",
+            "fetch_books.py",
+            "--top",
+            str(GUTENDEX_TOP),
+            "--pages",
+            str(GUTENDEX_PAGES),
         ],
         cwd=REPO_DIR,
+        timeout=5400,
     )
+    en_dir = Path(REPO_DIR, "data", "raw", "en_literature")
+    en_files = len(list(en_dir.glob("gutendex_*.txt"))) if en_dir.exists() else 0
+    if rc != 0 or en_files < MIN_BOOKS:
+        print(f"  gutendex thin ({en_files} books) -> curated classics fallback")
+        sh(
+            [
+                sys.executable,
+                "-c",
+                f"import prepare_data as pd; s,c=pd.collect_books({EXTRA_BOOKS}, 8); print(s); print(c)",
+            ],
+            cwd=REPO_DIR,
+        )
     sh([sys.executable, "build_corpus.py", "--vocab-size", str(VOCAB)], cwd=REPO_DIR)
 
     # ---- 4. smoke test: 60 steps on the real model, catch OOM/NaN early ------
@@ -186,15 +233,16 @@ def main() -> None:
             "--mix",
             MIX,
             "--val-every",
-            str(STEPS // 3),
+            "60",
         ],
         cwd=REPO_DIR,
     )
 
-    # ---- 5. probe batch size, then train --------------------------------------
+    # ---- 5. probe batch, estimate steps, then train ---------------------------
     print("== [5/6] train ==")
     bs = probe_batch()
     print(f"  batch={bs} selected")
+    steps = estimate_steps(bs)
     cmd = [
         sys.executable,
         "train/train.py",
@@ -207,7 +255,7 @@ def main() -> None:
         "--threads",
         "1",
         "--steps",
-        str(STEPS),
+        str(steps),
         "--batch-size",
         str(bs),
         "--seq-len",
