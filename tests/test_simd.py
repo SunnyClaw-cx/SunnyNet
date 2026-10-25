@@ -236,15 +236,19 @@ def test_avx512_indexing_matches_reference():
 
 
 def test_simd_backend_dispatch_stays_avx2_without_avx512():
-    """无 AVX-512 的机器上分派须落在 AVX2, 且三入口结果与参考一致."""
-    from sunnynet.kernels import core_auto as CA
+    """无 AVX-512 的机器上分派须落在 AVX2, 且三入口结果与参考一致.
+
+    simd 作业不装 torch, 而 core_auto 顶层 import torch: 先确认 torch 可导入,
+    否则本用例报 ModuleNotFoundError 而非跳过。
+    """
+    torch = pytest.importorskip("torch")
     from sunnynet.kernels import kernel_available
     if not kernel_available():
         pytest.skip("无 C 工具链")
     if simd.avx512_supported():
         pytest.skip("本机支持 AVX-512, 该用例只覆盖回退分支")
+    from sunnynet.kernels import core_auto as CA
     assert CA.backend_name() == "avx2"
-    import torch
     torch.manual_seed(0)
     B, T, D = 2, 7, 32
     q = torch.randn(B, T, 2 * D)

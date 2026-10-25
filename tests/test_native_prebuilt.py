@@ -123,6 +123,8 @@ def test_build_prebuilt_while_libs_are_loaded(tmp_path):
     该文件一旦被本进程加载过, 编译必失败。
     """
     from sunnynet.runtime import model
+    if not model.model_available():
+        pytest.skip("无编译器且无预编译产物")
     model._load()                       # 让 model 库处于已加载状态
     made, err = _native.build_prebuilt(tmp_path)
     if err:

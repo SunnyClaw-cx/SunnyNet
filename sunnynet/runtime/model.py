@@ -90,6 +90,11 @@ def get_threads() -> int:
     return _load().sn_get_threads()
 
 
+def _cores_fallback() -> int:
+    import os
+    return max(1, (os.cpu_count() or 2) // 2)
+
+
 def recommended_threads() -> int:
     """物理核数; C 侧探测失败时回退到逻辑核的一半。
 
@@ -104,14 +109,14 @@ def recommended_threads() -> int:
                 return len(big)
     except Exception:
         pass
-    lib = _load()
+    try:
+        lib = _load()
+    except RuntimeError:
+        return _cores_fallback()
     if not hasattr(lib, "sn_recommended_threads"):
         return 0
     n = int(lib.sn_recommended_threads())
-    if n <= 0:
-        import os
-        n = max(1, (os.cpu_count() or 2) // 2)
-    return n
+    return n if n > 0 else _cores_fallback()
 
 
 def pin_to_big_cores(threads: int = 0) -> list[int]:
