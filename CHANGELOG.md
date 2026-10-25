@@ -23,6 +23,19 @@
   展示（参数/硬件/步数/token 数/最佳 val + 真实生成样例），并给出
   tokens/param 这一贯穿结论与「流畅≠连贯」的读数。
 
+### TinyStories 语料 + 大域编码 OOM 修复
+- `fetch_tiny_stories.py`（新增）：断点续传下载 TinyStories
+  （HF `roneneldan/TinyStories` 的 `TinyStories-train.txt`，1.9 GB，~50k 短故事、
+  ~1.16B token），按故事边界（空行）切成 ~4MB 分片写入 `data/raw/tiny_stories/`，
+  作为插件式域（`--mix tiny_stories=1.0`，`train.py`/`DomainMixer` 无需改代码）。
+- `kaggle/tiny_stories/`（新增）：自包含 P100 内核 —— 故事专用 BPE、流式编码、
+  `proto20m` 21M @ seq 512 训 ~150M token（≈9 tok/非嵌入参数），里程碑采样到
+  `/kaggle/output`。
+- `build_corpus.encode_domain`：改逐文件 uint16 流式拼接，不再攒整域 Python
+  int 列表（旧实现峰值内存 ∝ 整域 token 数，~1.2B token 语料会 OOM）。
+  回归测试 `tests/test_build_corpus.py`（大域 token 计数 / 文件级 train-val 切分
+  不泄漏 / 空域）。
+
 ## v0.3.0
 
 ### 层数扩展的代价机制与新预设

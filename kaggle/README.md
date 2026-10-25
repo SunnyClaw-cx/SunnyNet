@@ -6,19 +6,21 @@ clones this repo, applies the `--save-every` milestone patch to `train/train.py`
 builds its own corpus, smoke-tests, trains, and writes milestone samples to
 `/kaggle/output` (pullable with `kaggle kernels pull`).
 
-## The three kernels
+## The four kernels
 
 | Kernel | `--preset` | Data | Goal |
 |--------|-----------|------|------|
 | `sunnynet_p100.py` | `p100m` (94M) | ~200 diverse EN books + code | 94M English prose |
 | `code_mix/sunnynet_code_mix.py` | `p100m` (94M) | 70% EN prose + 30% Python | stage-2 code mix |
 | `big_data/sunnynet_bigdata.py` | `proto20m` (21M) | ~1,000 diverse EN books, seq 1024 | **stage-1 coherent prose** (high tokens/param) |
+| `tiny_stories/sunnynet_tinystories.py` | `proto20m` (21M) | TinyStories (roneneldan/TinyStories, HF), seq 512, ~150M tokens | **coherent short stories** (~9 tok/param on simple data) |
 
 ## Run one
 
 ```sh
 pip install kaggle  # then: kaggle login
 kaggle kernels push -p kaggle/big_data -t 32400   # -> kitastro/... big-data run
+kaggle kernels push -p kaggle/tiny_stories -t 32400   # -> kitastro/... TinyStories run
 # point a browser at the slug it prints; ~7h; results under the kernel's "Output" tab
 kaggle kernels pull <owner>/<slug>   # grabs /kaggle/output (results.json + ckpts)
 ```
@@ -41,6 +43,13 @@ clone a branch other than `SunnyClaw-cx/SunnyNet:main`.
   lands at a meaningful token/param ratio instead of a fixed arbitrary step count.
 - **VRAM probe.** `probe_batch()` starts from the largest batch and steps down
   on OOM, so the same kernel works on T4 / P100 / V100.
+- **TinyStories inlines its own streaming encoder.** The upstream
+  `build_corpus.encode_domain` builds a whole-domain Python `int` list (peak
+  memory ∝ total tokens), which OOMs at TinyStories' ~1.16B tokens. The kernel
+  writes its per-file uint16 encoder directly and targets a **token budget**
+  (~150M, ≈9 tok/non-embed-param) rather than whole epochs, staying inside the
+  9 h P100 cap. The same streaming fix is in the repo's `build_corpus.py` (this
+  PR) for local use.
 
 ## Reading the outputs
 

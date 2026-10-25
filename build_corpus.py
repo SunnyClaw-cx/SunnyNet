@@ -68,11 +68,14 @@ def encode_domain(tk: BPETokenizer, domain: str, val_ratio: float, verbose: bool
         train_files, val_files = texts, texts[:1]
 
     def enc(pairs):
-        out: list[int] = []
+        # 逐文件编码为 uint16 再拼接: 峰值内存受最大单文件约束, 而非整域 token
+        # 数 (旧实现把整域 Python int 列表攒在内存, 大语料 [如 TinyStories 的
+        # ~1.2B token] 会 OOM).
+        parts: list[np.ndarray] = []
         for _, t in pairs:
-            out.extend(tk.encode(t))
-            out.append(tk.eos_id)
-        return np.asarray(out, dtype=np.uint16)
+            parts.append(np.asarray(tk.encode(t), dtype=np.uint16))
+            parts.append(np.asarray([tk.eos_id], dtype=np.uint16))
+        return np.concatenate(parts)
 
     tr = enc(train_files)
     va = enc(val_files)
