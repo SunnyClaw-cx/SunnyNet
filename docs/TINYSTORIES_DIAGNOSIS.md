@@ -1,9 +1,9 @@
 # TinyStories 训练质量诊断
 
-用户反馈：在微小故事数据集上训练 SunnyNet，即使走到 20000 步，生成仍然不能
-正确响应；怀疑架构有缺陷或配置有误，且此现象此前出现过。
+现象：在微小故事数据集上训练 SunnyNet，走到 20000 步后生成仍不能正确响应。
+怀疑点在架构或配置。
 
-结论先说：**架构不是根因。** 定位到两处可复现问题，一处是代码缺陷，一处是训练预算。
+结论：**架构不是根因。** 定位到两处可复现问题，一处是代码缺陷，一处是训练预算。
 
 ## 1. 根因一：BPE 训练器的 pair 计数缺陷（代码缺陷，已修）
 
@@ -62,14 +62,53 @@ B=8、T=256 = 6.14M token 训练。评测用 **BPC（bits-per-character）**—�
 | `syrinx-10m` | 11.8M | 0.29B |
 | `Compactbot/tinystories-24m` | 24.6M | 0.45B |
 
-对照用户场景：20000 步 × B8 × T256 = **41M token**（1.41M 模型上约 29 token/参数）。
-即使按 B16/T512 也只有 164M token，仍与 ~1B 差 6× 以上。**这才是"两万步仍不会写故事"
+对照报告的场景：20000 步 × B8 × T256 = **41M token**（1.41M 模型上约 29 token/参数）。
+即使按 B16/T512 也只有 164M token，仍与 ~1B 差 6× 以上。**这是"两万步仍不会写故事"
 的另一半原因。**
 
-同预算下其他架构也做不到长距连贯——对照实验（`experiments/_tiny_bench.py`，
-同数据同分词器同步数）见 `results/tiny/`。
+同预算下其他架构也做不到长距连贯——对照实验（`experiments/_tiny_bench.py`）
+见下节。
 
-## 4. 建议
+## 4. 跨架构对照（同数据 / 同分词器 / 同步数）
+
+TinyStories-valid 故事级切分、修复后分词器、3000 步 × B=8 × T=256 = 6.14M token、
+栈参数对齐 ~365k（`small` 预设 1.41M 总参数）。指标 BPC。
+
+| 架构 | 总参数量 | val ppl | **BPC** | tok/param |
+|---|---|---|---|---|
+| RWKV | 1,158,144 | 5.868 | **1.1251** | 5.31 |
+| Mamba | 1,088,032 | 5.963 | 1.1350 | 5.65 |
+| **SunnyNet** | 1,414,420 | 6.111 | 1.1458 | 4.34 |
+| H3 | 1,206,608 | 6.239 | 1.1584 | 5.09 |
+| Hyena | 1,286,992 | 6.362 | 1.1750 | 4.77 |
+| Linear-Attn | 1,160,544 | 7.992 | 1.3076 | 5.29 |
+
+SunnyNet 位列第三：落后 RWKV 1.8%、Mamba 0.9%，领先 H3 1.1%、Hyena 2.5%。
+注意 SunnyNet 在此格的 tok/param（4.34）低于 rwkv/mamba（5.31/5.65），
+即它在更少的 token 预算下取得了相近的 BPC。
+
+**口径边界**：六格训练到 6.14M token 即停止，远未收敛；只作同预算下的
+相对定位，不得外推为最终质量。跨架构参数按栈参数对齐，层数未强制一致
+（rwkv/h3 的层数为 4，SunnyNet 亦为 4）。单种子单次读数。
+
+## 5. 与公开 TinyStories 模型的对照口径
+
+公开模型的数字**不能直接与本项目对比**，因为三者不同：分词器不同、
+数据切分不同、训练预算差一个数量级。
+
+| 模型 | 参数量 | tokens seen | tokenizer | val ppl |
+|---|---|---|---|---|
+| karpathy `stories15M` | 15.2M | ~1B | Llama-2 32K BPE | 2.92 |
+| `child-12m` | 12.3M | ~1.0B | 8K custom BPE | 3.45 |
+| `pluto-15M` | 15M | ~1B | — | ~3.64 |
+| `syrinx-10m` | 11.8M | 0.29B | 32K byte-BPE | 4.78 |
+| `Compactbot/tinystories-24m` | 24.6M | 0.45B | 8K BPE | 8.76 |
+| **本项目 SunnyNet（本次对照）** | 1.41M | **0.006B** | 8K BPE | 6.111 |
+
+上表最后一行与其余各行**不在同一预算量级**（差 50–170×），列于此只为说明
+差距来源。跨分词器比较 ppl 无效，必须转 BPC 或 bits-per-byte。
+
+## 6. 建议
 
 1. **重训分词器**：升级后重新跑 `build_corpus.py`，旧 token 流与旧 checkpoint 的
    embedding 都不再可用（词表语义已变）。这会同时影响项目内所有模型。
@@ -79,7 +118,7 @@ B=8、T=256 = 6.14M token 训练。评测用 **BPC（bits-per-character）**—�
 4. **上下文**：TinyStories 故事平均约 200 词，T=256 够用，但配合修复后的分词器
    实际覆盖约 500 字符，信息量翻倍。
 
-## 5. 复现
+## 7. 复现
 
 ```sh
 # 缺陷量化
@@ -93,7 +132,7 @@ python -X utf8 experiments/_tiny_bench.py --tok fixed_en  --arch sunnynet --step
 python -X utf8 experiments/_tiny_bench.py --tok fixed_en --arch {transformer,rwkv,mamba,linear_attn,hyena,h3}
 ```
 
-## 6. 口径边界
+## 8. 口径边界
 
 - 上述对照训练到 6.14M token，**远未收敛**；只读作同预算下的相对优劣，
   不得外推为最终质量。
