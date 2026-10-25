@@ -65,6 +65,8 @@ sunnynet/_prebuilt/
 
 # 外部模型权重 (体积大, 由 download 脚本按需获取)
 experiments/gguf/
+experiments/ext_models/
+experiments/ext_results/
 
 # 第三方参考实现 (仅本地对照用, 版权归原作者)
 .ref/
