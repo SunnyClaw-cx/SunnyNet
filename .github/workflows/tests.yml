@@ -24,7 +24,21 @@ jobs:
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install numpy pytest
       - name: Architecture self-check
-        run: pytest tests/ -q
+        shell: bash
+        run: |
+          set -o pipefail
+          pytest tests/ -q --tb=short -rf 2>&1 | tee "$RUNNER_TEMP/pytest.log"
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            {
+              echo "### architecture-selfcheck (${{ matrix.os }}, ${{ matrix.python-version }})"
+              echo
+              echo '```'
+              tail -200 "$RUNNER_TEMP/pytest.log"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$rc"
 
   smoke-train:
     runs-on: ubuntu-latest
