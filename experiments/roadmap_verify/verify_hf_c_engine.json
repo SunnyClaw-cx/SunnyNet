@@ -1,0 +1,62 @@
+{
+  "deltanet": {
+    "arch": "deltanet",
+    "blob": "deltanet.c.bin",
+    "blob_mb": 1303.1,
+    "numpy_engine": "HFEngine",
+    "c_engine": "HFCEngine",
+    "c_engine_name": "deltanet-c",
+    "numpy_text": "the city of Paris. It",
+    "c_text": "the city of Paris. It",
+    "text_same": true,
+    "first_step_max_abs_diff": 7.152557373046875e-06,
+    "first_step_rel_diff": 5.47735035294585e-07,
+    "argmax_same": true,
+    "c_engine_load_s": 0.98
+  },
+  "mamba2": {
+    "arch": "mamba2",
+    "blob": "mamba2.c.bin",
+    "blob_mb": 492.1,
+    "numpy_engine": "HFEngine",
+    "c_engine": "HFCEngine",
+    "c_engine_name": "mamba2-c",
+    "numpy_text": " a city of the French people",
+    "c_text": " a city of the French people",
+    "text_same": true,
+    "first_step_max_abs_diff": 0.00011444091796875,
+    "first_step_rel_diff": 2.1846555329824e-06,
+    "argmax_same": true,
+    "c_engine_load_s": 0.88
+  },
+  "gla": {
+    "arch": "gla",
+    "blob": "gla.c.bin",
+    "blob_mb": 1303.5,
+    "numpy_engine": "HFEngine",
+    "c_engine": "HFCEngine",
+    "c_engine_name": "gla-c",
+    "numpy_text": "the city of Paris.\n",
+    "c_text": "the city of Paris.\n",
+    "text_same": true,
+    "first_step_max_abs_diff": 5.7220458984375e-06,
+    "first_step_rel_diff": 3.784695008775762e-07,
+    "argmax_same": true,
+    "c_engine_load_s": 1.94
+  },
+  "hgrn2": {
+    "arch": "hgrn2",
+    "blob": "hgrn2.c.bin",
+    "blob_mb": 5204.8,
+    "numpy_engine": "HFEngine",
+    "c_engine": "HFCEngine",
+    "c_engine_name": "hgrn2-c",
+    "numpy_text": "Paris.\n<p>",
+    "c_text": "Paris.\n<p>",
+    "text_same": true,
+    "first_step_max_abs_diff": 1.049041748046875e-05,
+    "first_step_rel_diff": 4.586712211329012e-07,
+    "argmax_same": true,
+    "c_engine_load_s": 0.19
+  }
+}

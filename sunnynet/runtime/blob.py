@@ -31,6 +31,66 @@ def blob_path(gguf: str | Path, quant: str = "int4") -> Path:
     return p.with_suffix(".q4.bin" if quant == "int4" else ".runtime.bin")
 
 
+# general.architecture -> 本包已实现的架构名。只有 rwkv7 能由 GGUF 直出 C blob;
+# 其余四个走 HF 权重 + 预导出的 .c.bin, 见 HF_ARCHES。
+GGUF_ARCHES = {
+    "rwkv7": "rwkv7", "rwkv": "rwkv7",
+    "mamba2": "mamba2", "mamba": "mamba2",
+    "deltanet": "deltanet", "delta_net": "deltanet",
+    "gla": "gla",
+    "hgrn2": "hgrn2",
+}
+
+
+def gguf_arch(gguf: str | Path) -> str:
+    """读 general.architecture 并归一到本包的架构名 (未识别的原样返回)."""
+    g = GGUFModel(gguf)
+    raw = str(g.meta.get("general.architecture", "") or "").strip().lower()
+    return GGUF_ARCHES.get(raw, raw)
+
+
+def require_rwkv7_gguf(gguf: str | Path) -> None:
+    """GGUF -> C blob 目前只覆盖 RWKV-7, 喂别的架构要在入口就报清楚."""
+    arch = gguf_arch(gguf)
+    if arch == "rwkv7":
+        return
+    hint = (f"该 GGUF 的架构是 {arch!r}, 但 GGUF 直出 C 内核 blob 目前只支持 RWKV-7。\n"
+            f"其余架构请用 HF 权重目录:\n"
+            f"  sunnynet chat --hf-dir <权重目录> --hf-arch {arch} --blob <架构>.c.bin\n"
+            f"(--hf-arch 取值: mamba2 / deltanet / gla / hgrn2)")
+    raise SystemExit(hint)
+
+
+# 整模型 C 内核 blob 的头部协议, 由各架构的 .c 定义, 两处必须同步改
+# DeltaNet / Mamba-2: <8i + f 后是 3 个 int (vocab, conv, tied) -> vocab 在 int 索引 9
+# GLA / HGRN2:        <8i + 4f 后是 5 个 int                    -> vocab 在 int 索引 12
+_HF_BLOB_LAYOUT = {
+    0x4E4E4444: ("<8if3i", 48, 9),   # DeltaNet fp32
+    0x51444E44: ("<8if3i", 48, 9),   # DeltaNet INT4
+    0x324E4D53: ("<8if3i", 48, 9),   # Mamba-2
+    0x414C4753: ("<8i4f5i", 68, 12),  # GLA fp32
+    0x51414C47: ("<8i4f5i", 68, 12),  # GLA INT4
+    0x32474853: ("<8i4f5i", 68, 12),  # HGRN2 fp32
+    0x51474853: ("<8i4f5i", 68, 12),  # HGRN2 INT4
+}
+
+
+def read_blob_vocab(path: str | Path) -> int:
+    """从整模型 C 内核 blob 头部读 vocab, 免为拿一个数加载整份权重."""
+    with open(path, "rb") as f:
+        head = f.read(max(n for _, n, _ in _HF_BLOB_LAYOUT.values()))
+    if len(head) < 4:
+        raise ValueError(f"blob 头部不完整: {path}")
+    magic = struct.unpack("<i", head[:4])[0]
+    fmt = _HF_BLOB_LAYOUT.get(magic)
+    if fmt is None:
+        raise ValueError(f"不是 C 内核 blob (magic {magic:#x}): {path}")
+    fmt, need, idx = fmt
+    if len(head) < need:
+        raise ValueError(f"blob 头部不完整 ({len(head)} < {need}): {path}")
+    return int(struct.unpack(fmt, head[:need])[idx])
+
+
 def _fresh(blob: Path, gguf: Path) -> bool:
     return blob.exists() and blob.stat().st_mtime >= gguf.stat().st_mtime
 
@@ -141,6 +201,7 @@ def ensure_rwkv7_blob(gguf: str | Path, quant: str = "int4",
                       rebuild: bool = False) -> Path:
     """返回可用的 C 内核 blob, 缺失或过期时按需导出."""
     gguf = Path(gguf)
+    require_rwkv7_gguf(gguf)
     blob = blob_path(gguf, quant)
     if rebuild or not _fresh(blob, gguf):
         write_rwkv7_blob(gguf, blob, int4=(quant == "int4"))

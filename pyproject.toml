@@ -37,6 +37,7 @@ Sponsor = "https://afdian.com/a/sunny-cx"
 [project.scripts]
 sunnynet = "sunnynet.cli:main"
 sunnynet-serve = "sunnynet.serve:main"
+sunnynet-ollama = "sunnynet.ollama:main"
 sunnynet-integrate = "sunnynet.integrate:main"
 sunnynet-release = "sunnynet.release:main"
 

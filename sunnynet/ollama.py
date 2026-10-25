@@ -20,7 +20,8 @@ import json
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .serve import Engine, build_engine, generate_stream, _messages_to_prompt
+from .serve import (Engine, HF_ARCHES, build_engine, generate_stream,
+                    _messages_to_prompt, _resolve_model_flags)
 
 __all__ = ["ollama_handler", "serve_ollama", "main"]
 
@@ -227,21 +228,14 @@ def main(argv=None) -> int:
     ap.add_argument("--quant", choices=["fp32", "int4"], default="int4")
     ap.add_argument("--blob", default=None)
     ap.add_argument("--hf-dir", default=None)
-    ap.add_argument("--hf-arch", choices=["mamba2", "deltanet", "gla", "hgrn2"],
-                    default="gla")
+    ap.add_argument("--hf-arch", choices=list(HF_ARCHES), default="gla")
     ap.add_argument("--tokenizer-dir", default=None)
+    ap.add_argument("--threads", type=int, default=0, help="0 = 不限制")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=11434)
     args = ap.parse_args(argv)
 
-    if args.model and not (args.gguf or args.ckpt or args.hf_dir):
-        p = args.model
-        if p.endswith(".gguf"):
-            args.gguf = p
-        elif p.endswith(".pt"):
-            args.ckpt = p
-        else:
-            args.hf_dir = p
+    _resolve_model_flags(args)
     eng = build_engine(args)
     httpd = serve_ollama(eng, args.host, args.port)
     print(f"[sunnynet-ollama] {eng.name} 监听 http://{args.host}:{args.port}",

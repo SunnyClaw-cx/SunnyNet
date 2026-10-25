@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -23,7 +24,19 @@ import numpy as np
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_TOKENIZER = REPO / "data" / "proc" / "tokenizer.json"
 
-__all__ = ["build_engine", "Engine", "serve", "main"]
+# --hf-arch 的合法取值, CLI / serve / ollama 三处共用, 免得再漂移
+HF_ARCHES = ("mamba2", "deltanet", "gla", "hgrn2")
+
+# 架构 -> (绑定模块, 句柄类); 整模型前向全在 C
+_HF_C = {
+    "deltanet": ("runtime.deltanet_c", "SnDeltaNet"),
+    "mamba2": ("runtime.mamba2_c", "SnMamba2"),
+    "gla": ("runtime.gla_c", "SnGLA"),
+    "hgrn2": ("runtime.hgrn2_c", "SnHGRN2"),
+}
+
+__all__ = ["build_engine", "Engine", "HFEngine", "HFCEngine", "HF_ARCHES",
+           "serve", "main"]
 
 
 # --------------------------------------------------------------------- 采样
@@ -106,8 +119,40 @@ class _SPTokenizer:
         return self.sp.decode([int(i) for i in ids])
 
 
+class _Wrap:
+    def __init__(self, tk):
+        self.tk = tk
+
+    def encode(self, text):
+        return list(self.tk.encode(text, add_special_tokens=True))
+
+    def decode(self, ids):
+        return self.tk.decode([int(i) for i in ids])
+
+
+def _hf_tokenizer(src: str | Path):
+    """HF 权重目录的分词器: sentencepiece 优先, 否则 transformers."""
+    src = Path(src)
+    sp_model = src / "tokenizer.model"
+    if sp_model.exists():
+        return _SPTokenizer(sp_model, bos_id=1, add_bos=True)
+    from transformers import AutoTokenizer
+    return _Wrap(AutoTokenizer.from_pretrained(str(src)))
+
+
+def _hf_eos(model_dir: str | Path, tokenizer_dir: str | None = None):
+    src = Path(tokenizer_dir or model_dir)
+    cp = src / "config.json"
+    if not cp.exists():
+        return None
+    try:
+        return json.loads(cp.read_text(encoding="utf-8")).get("eos_token_id")
+    except Exception:
+        return None
+
+
 class HFEngine(Engine):
-    """Mamba-2 / DeltaNet / GLA: HF safetensors 权重, numpy 单步."""
+    """Mamba-2 / DeltaNet / GLA / HGRN2: HF safetensors 权重, numpy 单步."""
 
     def __init__(self, arch: str, model_dir: str, tokenizer_dir: str | None = None):
         self.name = arch
@@ -117,34 +162,14 @@ class HFEngine(Engine):
             from .runtime.deltanet import DeltaNet as Model
         elif arch == "gla":
             from .runtime.gla import GLA as Model
+        elif arch == "hgrn2":
+            from .runtime.hgrn2 import HGRN2 as Model
         else:
             raise ValueError(f"未支持的 --hf-arch: {arch}")
         self.model = Model(model_dir)
         self.vocab = int(getattr(self.model, "vocab", 0))
-        src = tokenizer_dir or model_dir
-        cfg = {}
-        cp = Path(src) / "config.json"
-        if cp.exists():
-            cfg = json.loads(cp.read_text(encoding="utf-8"))
-        self.eos = cfg.get("eos_token_id")
-        self._build_tokenizer(src)
-
-    def _build_tokenizer(self, src: str):
-        sp_model = Path(src) / "tokenizer.model"
-        if sp_model.exists():
-            self.tk = _SPTokenizer(sp_model, bos_id=1, add_bos=True)
-            return
-        from transformers import AutoTokenizer
-        tk = AutoTokenizer.from_pretrained(src)
-
-        class _Wrap:
-            def encode(self, text):
-                return list(tk.encode(text, add_special_tokens=True))
-
-            def decode(self, ids):
-                return tk.decode([int(i) for i in ids])
-
-        self.tk = _Wrap()
+        self.eos = _hf_eos(model_dir, tokenizer_dir)
+        self.tk = _hf_tokenizer(tokenizer_dir or model_dir)
 
     def encode(self, text):
         return self.tk.encode(text)
@@ -160,11 +185,61 @@ class HFEngine(Engine):
         return np.asarray(logits, dtype=np.float32), state
 
 
+class HFCEngine(Engine):
+    """HF 架构走整模型 C 内核单步; 权重由 --blob 指定的 .c.bin / .q4.bin.
+
+    与 HFEngine 的区别只在 step: 前向全在 C, 状态由 C 侧持有, 故 init_state
+    只做 reset。句柄非线程安全, 用锁把单步串行化 (顺带也挡了并发下状态互踩)。
+    """
+
+    def __init__(self, arch: str, blob: str | Path, model_dir: str | None = None,
+                 tokenizer_dir: str | None = None, threads: int = 0):
+        if arch not in _HF_C:
+            raise ValueError(f"未支持的 --hf-arch: {arch}")
+        bp = Path(blob)
+        if not bp.exists():
+            raise SystemExit(f"缺少 C 内核 blob: {bp}")
+        mod_name, cls_name = _HF_C[arch]
+        import importlib
+        cls = getattr(importlib.import_module("." + mod_name, __package__), cls_name)
+        from .runtime.blob import read_blob_vocab
+        vocab = read_blob_vocab(bp)
+        self.model = cls(bp, vocab, threads=threads or None)
+        self.name = f"{arch}-c"
+        self.vocab = int(vocab)
+        self._lock = threading.Lock()
+        src = tokenizer_dir or model_dir
+        self.eos = _hf_eos(src) if src else None
+        self.tk = _hf_tokenizer(src) if src else None
+
+    def encode(self, text):
+        if self.tk is None:
+            raise RuntimeError("HFCEngine 未配分词器, 请给 --hf-dir 或 --tokenizer-dir")
+        return self.tk.encode(text)
+
+    def decode(self, ids):
+        if self.tk is None:
+            return ""
+        return self.tk.decode(ids)
+
+    def init_state(self):
+        with self._lock:
+            self.model.reset()
+        return None
+
+    def step(self, token, state):
+        with self._lock:
+            return np.asarray(self.model.step_np(int(token)),
+                              dtype=np.float32), state
+
+
 class GGUFEngine(Engine):
     """RWKV-7 GGUF 权重, numpy 单步."""
 
     def __init__(self, path: str):
+        from .runtime.blob import require_rwkv7_gguf
         from .runtime.rwkv7 import RWKV7
+        require_rwkv7_gguf(path)
         self.model = RWKV7(path)
         self.name = "rwkv7"
         self.vocab = int(self.model.vocab)
@@ -188,8 +263,10 @@ class GGUFCEngine(Engine):
     """RWKV-7 走 C 内核整模型单步; 词表/分词复用 numpy 侧的 RWKV7."""
 
     def __init__(self, path: str, blob: str | None = None, quant: str = "fp32"):
+        from .runtime.blob import require_rwkv7_gguf
         from .runtime.rwkv7 import RWKV7
         from .runtime.rwkv7_c import SnRWKV7
+        require_rwkv7_gguf(path)
         tok = RWKV7(path)
         if blob:
             bp = Path(blob)
@@ -251,8 +328,34 @@ class TorchEngine(Engine):
         return logits[0].numpy().astype(np.float32), st
 
 
+def _resolve_model_flags(args) -> None:
+    """把 -m/--model 映射到既有 flag, 按后缀识别 .gguf / .pt / HF 目录。
+
+    CLI / serve / ollama 三处共用, 免得 -m 的识别规则各写一份。
+    """
+    m = getattr(args, "model", None)
+    if not m:
+        return
+    if getattr(args, "gguf", None) or getattr(args, "ckpt", None) \
+            or getattr(args, "hf_dir", None):
+        return
+    p = Path(m)
+    if p.suffix == ".gguf" or p.name.endswith(".gguf"):
+        args.gguf = m
+    elif p.suffix == ".pt":
+        args.ckpt = m
+    elif p.is_dir():
+        args.hf_dir = m
+    else:
+        args.gguf = m
+
+
 def build_engine(args) -> Engine:
     if args.hf_dir:
+        blob = getattr(args, "blob", None)
+        if blob:
+            return HFCEngine(args.hf_arch, blob, args.hf_dir, args.tokenizer_dir,
+                             threads=getattr(args, "threads", 0) or 0)
         return HFEngine(args.hf_arch, args.hf_dir, args.tokenizer_dir)
     if args.gguf:
         if args.gguf_backend == "c":
@@ -502,20 +605,27 @@ def main(argv=None):
                                  description="OpenAI 兼容的 SunnyNet 本地服务")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("-m", "--model", default=None,
+                    help=".gguf / .pt / HF 目录, 按后缀自动识别")
     ap.add_argument("--ckpt", default=None)
     ap.add_argument("--gguf", default=None)
     ap.add_argument("--gguf-backend", choices=["numpy", "c"], default="numpy")
     ap.add_argument("--quant", choices=["fp32", "int4"], default="fp32")
     ap.add_argument("--blob", default=None)
     ap.add_argument("--hf-dir", default=None)
-    ap.add_argument("--hf-arch", choices=["mamba2", "deltanet", "gla"],
-                    default="gla")
+    ap.add_argument("--hf-arch", choices=list(HF_ARCHES), default="gla")
     ap.add_argument("--tokenizer-dir", default=None)
     ap.add_argument("--tokenizer", default=str(DEFAULT_TOKENIZER))
+    ap.add_argument("--threads", type=int, default=0, help="0 = 不限制")
+    ap.add_argument("--model-name", default=None,
+                    help="对外暴露的模型名 (默认按权重名)")
     args = ap.parse_args(argv)
 
+    _resolve_model_flags(args)
     t0 = time.perf_counter()
     engine = build_engine(args)
+    if args.model_name:
+        engine.name = args.model_name
     print(f"[sunnynet] 模型 {engine.name} vocab={engine.vocab} "
           f"加载 {time.perf_counter()-t0:.2f}s", flush=True)
     httpd = serve(engine, args.host, args.port)

@@ -17,6 +17,7 @@ from pathlib import Path
 import torch
 
 from .model import SunnyConfig, SunnyNet
+from .serve import HF_ARCHES
 from .tokenizer import BPETokenizer
 
 __all__ = ["main", "load_model", "decode_stream"]
@@ -261,25 +262,8 @@ def _main_rwkv7_blob(args) -> int:
 
 def _dn_vocab(blob: str, hf_dir: str) -> int:
     """从 blob 头部读 vocab (避免为拿一个数加载整个 HF 权重)。"""
-    import struct
-    with open(blob, "rb") as f:
-        head = f.read(72)
-    if len(head) < 48:
-        raise SystemExit(f"blob 头部不完整: {blob}")
-    magic = struct.unpack("<i", head[:4])[0]
-    if magic in (0x4E4E4444, 0x324E4D53):        # DeltaNet / Mamba-2
-        return int(struct.unpack("<8if3i", head[:48])[9])
-    if magic == 0x51444E44:                       # DeltaNet INT4: 头部布局相同
-        return int(struct.unpack("<8if3i", head[:48])[9])
-    if magic == 0x414C4753:                       # GLA: 8 int + 4 float 后是 meta
-        return int(struct.unpack("<8i4f5i", head[:68])[12])
-    if magic == 0x51414C47:                       # GLA INT4: 头部布局相同
-        return int(struct.unpack("<8i4f5i", head[:68])[12])
-    if magic == 0x32474853:                       # HGRN2: 同 GLA 头部布局
-        return int(struct.unpack("<8i4f5i", head[:68])[12])
-    if magic == 0x51474853:                       # HGRN2 INT4: 头部布局相同
-        return int(struct.unpack("<8i4f5i", head[:68])[12])
-    raise SystemExit(f"不是 C 内核 blob (magic {magic:#x}): {blob}")
+    from .runtime.blob import read_blob_vocab
+    return read_blob_vocab(blob)
 
 
 class _CAdapter:
@@ -303,6 +287,11 @@ class _CAdapter:
         if sn is not None:
             return sn(int(token))
         return np.asarray(self.h.step(int(token)), dtype=np.float32)
+
+
+def _use_c_backend(args) -> bool:
+    """--blob 配合 --hf-arch 时走整模型 C 内核 (与 serve.HFCEngine 同一判据)."""
+    return bool(args.blob) and args.hf_arch in HF_ARCHES
 
 
 def _dn_layers(hf_dir: str) -> int:
@@ -335,15 +324,7 @@ def _main_hf(args) -> int:
         raise SystemExit(f"未支持的 --hf-arch: {args.hf_arch}")
 
     t0 = time.perf_counter()
-    c_arch = None
-    if args.blob and args.hf_arch == "deltanet":
-        c_arch = "deltanet"
-    elif args.blob and args.hf_arch == "mamba2":
-        c_arch = "mamba2"
-    elif args.blob and args.hf_arch == "gla":
-        c_arch = "gla"
-    elif args.blob and args.hf_arch == "hgrn2":
-        c_arch = "hgrn2"
+    c_arch = args.hf_arch if _use_c_backend(args) else None
     if c_arch == "deltanet":
         # 整模型 C 内核: 前向全在 C, 与 numpy 参考路径逐 token 一致
         from .runtime.deltanet_c import SnDeltaNet
@@ -628,7 +609,7 @@ def _add_infer_args(ap, *, gguf_backend_default: str = "numpy"):
                          "读字节减半, 单步约快 1.3x, logits 相对偏差约 7e-4")
     ap.add_argument("--hf-dir", default=None,
                     help="HF 权重目录 (Mamba-2 / DeltaNet / GLA / HGRN2), 与 --ckpt/--gguf 三选一")
-    ap.add_argument("--hf-arch", choices=["mamba2", "deltanet", "gla", "hgrn2"],
+    ap.add_argument("--hf-arch", choices=list(HF_ARCHES),
                     default="mamba2",
                     help="--hf-dir 的架构")
     ap.add_argument("--stats", action="store_true", help="输出解码耗时统计")
@@ -636,21 +617,8 @@ def _add_infer_args(ap, *, gguf_backend_default: str = "numpy"):
 
 
 def _resolve_model_flags(args) -> None:
-    """把 -m/--model 映射到对应的既有 flag, 按后缀识别 .gguf / .pt / HF 目录."""
-    m = getattr(args, "model", None)
-    if not m:
-        return
-    if args.gguf or args.ckpt or args.hf_dir:
-        return
-    p = Path(m)
-    if p.suffix == ".gguf" or p.name.endswith(".gguf"):
-        args.gguf = m
-    elif p.suffix == ".pt":
-        args.ckpt = m
-    elif p.is_dir():
-        args.hf_dir = m
-    else:
-        args.gguf = m
+    from .serve import _resolve_model_flags as impl
+    impl(args)
 
 
 def main(argv=None):
