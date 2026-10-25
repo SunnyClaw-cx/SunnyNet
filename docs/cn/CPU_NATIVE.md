@@ -1,6 +1,6 @@
 # CPU 原生模型设计准则
 
-*[English](CPU_NATIVE.en.md)*
+*[English](../en/CPU_NATIVE.md)*
 
 本文回答一个问题：**主流架构是否为 GPU 而生？CPU 原生架构应该长什么样？**
 

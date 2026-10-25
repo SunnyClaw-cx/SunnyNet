@@ -1,6 +1,6 @@
 # CPU 的出路：四条候选路线的判决
 
-*[English](CPU_WAY_OUT.en.md)*
+*[English](../en/CPU_WAY_OUT.md)*
 
 `CPU_NATIVE.md` 确立了"CPU 原生架构该满足什么"。本文回答它的下一问：
 **CPU 上要真正做训练与推理，哪条路走得通、哪条堵死、边界在哪。**

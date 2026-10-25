@@ -139,7 +139,7 @@
 ### C API stable ABI
 - `sunnynet/runtime/sn_abi.h` / `sn_abi.c`: `sn_abi_` prefix isolation, opaque handles,
   capability bits, error codes, `SN_ABI_VERSION 1.0.0`. Bitwise consistent with the internal handle path (max|diff| 0.0).
-  Contract tests 9 items. See `docs/ABI.md`.
+  Contract tests 9 items. See `docs/cn/ABI.md`.
 
 ### SIMD backends
 - AVX-512F/BW/VL kernels (`sunnynet/kernels/scan_avx512.c`): compiles,

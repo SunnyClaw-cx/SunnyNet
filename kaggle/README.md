@@ -47,7 +47,7 @@ clone a branch other than `SunnyClaw-cx/SunnyNet:main`.
 Each `results.json` has `samples` (first / middle / final checkpoint × 3 prompts)
 and `val_history`. The samples are the honest quality signal — val loss
 understates overfitting when the val set overlaps the training corpus (see
-`docs/MODEL_SHOWCASE.md` §1, the footnote on non-comparable val loss).
+`docs/en/MODEL_SHOWCASE.md` §1, the footnote on non-comparable val loss).
 
-See `docs/MODEL_SHOWCASE.md` for the per-model results from the 2026-10-24
+See `docs/en/MODEL_SHOWCASE.md` for the per-model results from the 2026-10-24
 session these kernels were built for.

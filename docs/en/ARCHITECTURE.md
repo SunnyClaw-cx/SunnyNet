@@ -1,4 +1,4 @@
-*[中文版](ARCHITECTURE.md)*
+*[中文版](../cn/ARCHITECTURE.md)*
 
 # SunnyNet Architecture
 

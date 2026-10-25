@@ -1,4 +1,4 @@
-*[中文版](CPU_NATIVE.md)*
+*[中文版](../cn/CPU_NATIVE.md)*
 
 # Design Principles for CPU-Native Models
 

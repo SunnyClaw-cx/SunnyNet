@@ -1,4 +1,4 @@
-"""SunnyNet 原创基础算子. 推导见 docs/ARCHITECTURE.md."""
+"""SunnyNet 原创基础算子. 推导见 docs/cn/ARCHITECTURE.md."""
 from __future__ import annotations
 
 import math

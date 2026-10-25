@@ -1,4 +1,4 @@
-*[中文版](ROADMAP.md)*
+*[中文版](../cn/ROADMAP.md)*
 # Roadmap and verification record
 
 This file records the four boundaries of the CPU inference roadmap, the state of each deliverable,

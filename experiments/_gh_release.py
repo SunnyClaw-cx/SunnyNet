@@ -4,7 +4,7 @@
 只读 notes 文件作为 release body, 不改动它。
 
 用法:
-  GH_TOKEN=xxx python -X utf8 experiments/_gh_release.py v0.3.0 docs/RELEASE_v0.3.0.md dist/*.whl
+  GH_TOKEN=xxx python -X utf8 experiments/_gh_release.py v0.3.0 docs/en/RELEASE_v0.3.0.md dist/*.whl
 """
 from __future__ import annotations
 

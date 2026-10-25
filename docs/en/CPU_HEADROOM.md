@@ -1,4 +1,4 @@
-*[中文版](CPU_HEADROOM.md)*
+*[中文版](../cn/CPU_HEADROOM.md)*
 # Remaining headroom for CPU training speed
 
 Machine: i7-8750H (Coffee Lake, 6C12T, AVX2, no AVX-512 / no VNNI / no AMX)

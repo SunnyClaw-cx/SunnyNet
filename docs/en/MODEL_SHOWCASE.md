@@ -127,7 +127,7 @@ Final samples + val to be appended when the P100 run completes.
 Local checkpoints live in `runs/` (gitignored). The p100m English checkpoint +
 matching tokenizer are hosted at
 [CodeDoes/SunnyNet-P100M-Kaggle](https://github.com/CodeDoes/SunnyNet-P100M-Kaggle)
-(LFS); see `docs/KAGGLE_P100M.md`.
+(LFS); see `KAGGLE_P100M.md`.
 
 To run any of the kernels on Kaggle (free-tier GPU):
 

@@ -1,4 +1,4 @@
-*[中文版](EXPERIMENT_REPORT.md)*
+*[中文版](../cn/EXPERIMENT_REPORT.md)*
 
 # SunnyNet Experiment Report
 
@@ -142,7 +142,7 @@ Each architecture was swept over 3 learning-rate levels (260 steps), taking each
 This is the architecture's only claim, and it can only be tested with data. Method: fix the model (`small`),  
 vary the input sequence length, and measure the time of a single forward pass.
 
-![Sequence scaling](figures/seq_scaling.png)
+![Sequence scaling](../figures/seq_scaling.png)
 
 ### 2.1 Data
 
@@ -240,9 +240,9 @@ while the latter benchmarks against linear-class architectures that are also O(N
 
 Speed is not the only metric. Quality is compared under the same token budget (1200 steps × batch 8 × T 256 ≈ 2.45M tokens).
 
-![Baseline comparison](figures/speed_compare.png)
+![Baseline comparison](../figures/speed_compare.png)
 
-![Training curves](figures/loss_curves.png)
+![Training curves](../figures/loss_curves.png)
 
 | Metric                 | SunnyNet      | Transformer | Gap              |
 | ------------------ | ------------- | ----------- | --------------- |
@@ -323,7 +323,7 @@ rising markedly in the last segment, which is caused by **intensified CPU conten
 
 ## 5. Ablation experiment
 
-![Ablation](figures/ablation.png)
+![Ablation](../figures/ablation.png)
 
 600 steps, `small` preset, components switched off one at a time:
 
@@ -388,7 +388,7 @@ a single seed (seed=1234), and its 4.84% ppl gap **falls within the seed-noise l
 §2's crossover conclusion was derived from **forward latency**. To verify that it also holds in **real training**,  
 a training comparison was run at T=1024 (**above the crossover point of 834**) (200 steps, batch 4, `small` preset).
 
-![Long-sequence training comparison](figures/longseq_train.png)
+![Long-sequence training comparison](../figures/longseq_train.png)
 
 | Metric         | SunnyNet      | Transformer | SunnyNet advantage |
 | ---------- | ------------- | ----------- | ----------- |
@@ -614,7 +614,7 @@ answering "does SunnyNet's long-sequence advantage also apply to the peers".
 Protocol: batch=1 forward, 8 threads, an independent process per cell (§2.4 discipline), 9 repetitions, median.
 Script `experiments/on_scaling.py`, data `experiments/results/on_scaling_t8.json`.
 
-![Seven-architecture scaling](figures/on_scaling.png)
+![Seven-architecture scaling](../figures/on_scaling.png)
 
 ms/token (lower is better):
 
@@ -1833,7 +1833,7 @@ The six comparison architectures: `h3`, `rwkv`, `mamba`, `hyena`, `linear_attn`,
 
 Protocol: an independent subprocess per (path, T); first walk T steps token by token to build a real decoding state (not timed), then measure the single-step decoding ms at that context length; single-threaded (§22.5 already showed a tendency for single-threaded to beat multi-threaded in decoding mode); 2 rounds taking the median. Stack parameters aligned to 365,844. The eight paths include a whole-model C backend of the same specification (`sunnyC`, `d80` blob, one `sn_step` per token), listed separately from the torch path. Script `experiments/_decode_seven.py`, data `experiments/results/_decode_seven.json`.
 
-![Decode latency vs sequence length](figures/perf_decode.png)
+![Decode latency vs sequence length](../figures/perf_decode.png)
 
 ms/step (lower is better):
 
@@ -2128,7 +2128,7 @@ bandwidth; measured 6 physical cores 26.69 ms vs 12 logical cores 36.05 ms (26% 
 **The optimal thread count is set by weight size, not a fixed value.** Sweeping threads per blob tier on the same
 machine (`experiments/_decode_cthreads_size.py`, an independent process per tier):
 
-![Decode thread policy](figures/perf_threads.png)
+![Decode thread policy](../figures/perf_threads.png)
 
 At ≤23 MB (d80–d256) **a single thread is optimal**: the weights fit in cache and parallelism only adds synchronization
 overhead (d128 single thread 1.70 ms vs 4 threads 2.96 ms). From ≥39 MB (d384 up) the weights exceed cache capacity and the
@@ -3255,7 +3255,7 @@ Least squares: **`step_ms ≈ 32.9·L + 102.4`** (marginal 33 ms per layer, laye
 intercept 102 ms).
 ⇒ The depth cost is **linear with a constant slope**, not "exploding after some layer".
 
-![Scale and depth](figures/perf_scaling.png)
+![Scale and depth](../figures/perf_scaling.png)
 
 Left is stack parameters vs validation ppl (1.4M / 20M / 100M): **not monotonic**, 20M is the worst and 100M recovers,
 but the three tiers use different step budgets (600 / 300 / 100), so read the trend only and never subtract across tiers.

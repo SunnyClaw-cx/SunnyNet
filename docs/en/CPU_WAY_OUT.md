@@ -1,4 +1,4 @@
-*[中文版](CPU_WAY_OUT.md)*
+*[中文版](../cn/CPU_WAY_OUT.md)*
 
 # The Way Out for CPU: Verdicts on Four Candidate Routes
 

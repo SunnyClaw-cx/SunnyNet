@@ -1,6 +1,6 @@
 # SunnyNet 实验报告
 
-*[English](EXPERIMENT_REPORT.en.md)*
+*[English](../en/EXPERIMENT_REPORT.md)*
 
 数据全部来自本机实测，不引用论文数字、不做外推估算。每个数字都能在  
 `experiments/results/*.json` 中找到对应原始记录。未测、不可测或存在混淆因素的项，  
@@ -142,7 +142,7 @@
 这是本架构唯一的主张，只能靠数据检验。方法：固定模型（`small`），  
 改变输入序列长度，测量单次前向耗时。
 
-![序列缩放](figures/seq_scaling.png)
+![序列缩放](../figures/seq_scaling.png)
 
 ### 2.1 数据
 
@@ -240,9 +240,9 @@ batch=8 训练步对 O(N) 同行仍落后（§13）。
 
 速度不是唯一指标。同 token 预算（1200 步 × batch 8 × T 256 ≈ 245 万 token）下比较质量。
 
-![基线对照](figures/speed_compare.png)
+![基线对照](../figures/speed_compare.png)
 
-![训练曲线](figures/loss_curves.png)
+![训练曲线](../figures/loss_curves.png)
 
 | 指标                 | SunnyNet      | Transformer | 差距              |
 | ------------------ | ------------- | ----------- | --------------- |
@@ -323,7 +323,7 @@ batch=8 训练步对 O(N) 同行仍落后（§13）。
 
 ## 5. 消融实验
 
-![消融](figures/ablation.png)
+![消融](../figures/ablation.png)
 
 600 步，`small` 预设，逐组件关闭：
 
@@ -388,7 +388,7 @@ batch=8 训练步对 O(N) 同行仍落后（§13）。
 §2 的交叉点结论由**前向延迟**得出。为验证它在**真实训练**中同样成立，  
 在 T=1024（**高于交叉点 834**）上做训练对照（200 步，batch 4，`small` 预设）。
 
-![长序列训练对照](figures/longseq_train.png)
+![长序列训练对照](../figures/longseq_train.png)
 
 | 指标         | SunnyNet      | Transformer | SunnyNet 优势 |
 | ---------- | ------------- | ----------- | ----------- |
@@ -614,7 +614,7 @@ cosine 衰减至 0.1×、同一语料混合与验证集、同一种子（1234）
 协议：batch=1 前向、8 线程、每格独立进程（§2.4 纪律）、重复 9 次取中位数。
 脚本 `experiments/on_scaling.py`，数据 `experiments/results/on_scaling_t8.json`。
 
-![七架构缩放](figures/on_scaling.png)
+![七架构缩放](../figures/on_scaling.png)
 
 ms/token（越低越好）：
 
@@ -2065,7 +2065,7 @@ python -X utf8 experiments/_decode_longpath.py 256,512,1024,2048,4096 2  # §22.
 `d80` blob，走 `sn_step` 单步），与 torch 路径分列。脚本 `experiments/_decode_seven.py`，
 数据 `experiments/results/_decode_seven.json`。
 
-![解码延迟随序列长度](figures/perf_decode.png)
+![解码延迟随序列长度](../figures/perf_decode.png)
 
 ms/step（越低越好）：
 
@@ -2384,7 +2384,7 @@ GEMV 改成按输出通道并行的连续读。
 **最优线程数由权重规模决定，不是固定值**。同一台机上按 blob 档位扫线程
 （`experiments/_decode_cthreads_size.py`，每档独立进程）：
 
-![解码线程策略](figures/perf_threads.png)
+![解码线程策略](../figures/perf_threads.png)
 
 权重 ≤23 MB（d80–d256）时**单线程最优**：此时权重可驻留缓存，并行只会引入同步开销
 （d128 单线程 1.70 ms，4 线程 2.96 ms）。权重 ≥39 MB（d384 起）越过缓存容量、
@@ -3495,7 +3495,7 @@ SunnyNet 能否作为通用大模型骨架。本节把这条从"现象"落到"�
 最小二乘：**`step_ms ≈ 32.9·L + 102.4`**（每层边际 33 ms、与层数无关的截距 102 ms）。
 ⇒ 深度代价是**线性且斜率恒定**，不是"某层之后爆炸"。
 
-![规模与深度](figures/perf_scaling.png)
+![规模与深度](../figures/perf_scaling.png)
 
 左图是栈参数 vs 验证 ppl（1.4M / 20M / 100M）：**非单调**，20M 最差、100M 回升，
 但三档步数不同（600 / 300 / 100），只读趋势、禁跨档相减。右图即上式代价律的拟合。

@@ -1,4 +1,4 @@
-*[中文版](ABI.md)*
+*[中文版](../cn/ABI.md)*
 # Stable C ABI
 
 `sunnynet/runtime/sn_abi.h` defines the stable interface promised to the outside. Only symbols exposed through that header are bound by

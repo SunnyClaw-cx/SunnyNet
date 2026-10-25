@@ -1,6 +1,6 @@
 # Stable C ABI
 
-*[English](ABI.en.md)*
+*[English](../en/ABI.md)*
 
 `sunnynet/runtime/sn_abi.h` 定义对外承诺的稳定接口。只经该头文件暴露的符号受版本约束；
 内部实现（`sunnynet.h` / `rwkv7.h` / `recur.h` / `quant.h`）不属于稳定接口，可随时改动。

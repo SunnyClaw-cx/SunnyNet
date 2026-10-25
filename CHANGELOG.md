@@ -19,7 +19,7 @@
   `big_data/`（proto20m 21M 大语料 1000 本、seq 1024，冲 ~12 tokens/param）。
   各内核 base64 内嵌取数脚本、按 epoch 估算步数、VRAM 自探 batch、结果写
   `/kaggle/output`；`kaggle/README.md` 说明用法。
-- `docs/MODEL_SHOWCASE.md`（新增）：2026-10-24 一次会话训练的 7 个模型逐一
+- `docs/en/MODEL_SHOWCASE.md`（新增）：2026-10-24 一次会话训练的 7 个模型逐一
   展示（参数/硬件/步数/token 数/最佳 val + 真实生成样例），并给出
   tokens/param 这一贯穿结论与「流畅≠连贯」的读数。
 
@@ -160,7 +160,7 @@
 ### C API 稳定 ABI
 - `sunnynet/runtime/sn_abi.h` / `sn_abi.c`：`sn_abi_` 前缀隔离、不透明句柄、
   能力位、错误码、`SN_ABI_VERSION 1.0.0`。与内部句柄路径逐位一致（max|diff| 0.0）。
-  契约测试 9 项。详见 `docs/ABI.md`。
+  契约测试 9 项。详见 `docs/cn/ABI.md`。
 
 ### SIMD 后端
 - AVX-512F/BW/VL 内核（`sunnynet/kernels/scan_avx512.c`）：编译通过，

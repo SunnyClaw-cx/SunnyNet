@@ -1,4 +1,4 @@
-"""SunnyNet 网络层. 块内数据流与推导见 docs/ARCHITECTURE.md 第 1 节.
+"""SunnyNet 网络层. 块内数据流与推导见 docs/cn/ARCHITECTURE.md 第 1 节.
 
 状态协议 SunnyState(s=(B,L,D), hist=(B,L,k-1,D)) 保证单步与整段严格一致.
 """

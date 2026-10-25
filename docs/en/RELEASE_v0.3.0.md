@@ -77,5 +77,5 @@ pip install sunnynet-cx==0.3.0
 Every figure above is measured on one machine (i7-8750H, AVX2, 6 physical cores,
 15.87 GB RAM, torch 2.14.1+cpu) and reproducible from `experiments/`. Decode results
 are B=1, single sequence, randomly initialized models, torch for the peer
-architectures. Full detail: `docs/EXPERIMENT_REPORT.md`. Test suite: 164 passed,
+architectures. Full detail: `docs/en/EXPERIMENT_REPORT.md`. Test suite: 164 passed,
 36 skipped (skips need external weights).
