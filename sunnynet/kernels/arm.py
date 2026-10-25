@@ -48,7 +48,13 @@ def cpu_freqs() -> dict[int, int]:
 
 
 def big_cores(threshold: float = 0.9) -> list[int]:
-    """频率在最高档 threshold 以上的 CPU 编号; 无频率信息时取编号后半段."""
+    """频率在最高档 threshold 以上的 CPU 编号; 无频率信息时取编号后半段.
+
+    只在 ARM 上返回结果: x86 的"后半段"并不代表更快的核 (同构), 若返回会被
+    调用方误当成大核集合。
+    """
+    if not is_arm():
+        return []
     fr = cpu_freqs()
     if fr:
         top = max(fr.values())

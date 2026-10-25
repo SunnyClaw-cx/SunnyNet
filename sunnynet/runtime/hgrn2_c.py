@@ -97,6 +97,8 @@ class SnHGRN2:
             threads = _recommended_threads()
         if threads:
             self._lib.sn_hg_set_threads(int(threads))
+            from . import model as _model
+            _model.pin_to_big_cores(int(threads))
         self._logits = (ctypes.c_float * vocab)()
         self._h = self._lib.sn_hg_load(str(path).encode())
         if not self._h:

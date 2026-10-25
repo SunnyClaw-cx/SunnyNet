@@ -151,6 +151,15 @@ EXPORT void step_core512_tail_f32(const float* q, const float* delta,
     }
 }
 
+/* 单步整段入口: 内部处理 NG 为奇数时的收尾. */
+EXPORT void step_core512_all_f32(const float* q, const float* delta, const float* s,
+                                 float* s_new, float* u_out, int B, int D) {
+    const int NG = D >> 3;
+    step_core512_f32(q, delta, s, s_new, u_out, B, D);
+    if (NG & 1)
+        step_core512_tail_f32(q, delta, s, s_new, u_out, B, D, NG - 1);
+}
+
 #ifndef SN_512_NO_COMMON
 EXPORT int sn512_cpu_supported(void) {
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)

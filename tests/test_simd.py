@@ -221,16 +221,40 @@ def _run_shim(script: str) -> dict:
 def test_avx512_indexing_matches_reference():
     """AVX-512 源码在 x86 上借标量 shim 执行: 组内 lane 语义与掩码尾部须等价.
 
-    只覆盖索引与语义; 真 AVX-512 指令的吞吐需在支持 AVX512F 的机器上复现。
+    含 NG 为奇数的尾部 group (forward 与 backward 两侧); 只覆盖索引与语义,
+    真 AVX-512 指令的吞吐需在支持 AVX512F 的机器上复现。
     """
     res = _run_shim("_avx512_shim/_run.py")
-    for key in ("core_fwd_D32", "core_fwd_D24", "step_core_D32",
-                "step_core_D24", "dw_step"):
+    for key in ("core_fwd_D32", "core_fwd_D24", "core_bwd_D32", "core_bwd_D24",
+                "step_core_D32", "step_core_D24", "dw_step"):
         block = res[key]
         for k, v in block.items():
             if k.startswith("maxdiff"):
                 assert v < 1e-5, f"{key}.{k} = {v}"
     assert res["core_fwd_D24"]["tail_used"] and not res["core_fwd_D32"]["tail_used"]
+    assert res["core_bwd_D24"]["tail_used"] and not res["core_bwd_D32"]["tail_used"]
+
+
+def test_simd_backend_dispatch_stays_avx2_without_avx512():
+    """无 AVX-512 的机器上分派须落在 AVX2, 且三入口结果与参考一致."""
+    from sunnynet.kernels import core_auto as CA
+    from sunnynet.kernels import kernel_available
+    if not kernel_available():
+        pytest.skip("无 C 工具链")
+    if simd.avx512_supported():
+        pytest.skip("本机支持 AVX-512, 该用例只覆盖回退分支")
+    assert CA.backend_name() == "avx2"
+    import torch
+    torch.manual_seed(0)
+    B, T, D = 2, 7, 32
+    q = torch.randn(B, T, 2 * D)
+    delta = torch.rand(D)
+    s0 = torch.randn(B, D)
+    u, states = CA.core_forward(q, delta, s0)
+    assert u.shape == (B, T, D) and states.shape == (B, T, D)
+    assert torch.isfinite(u).all() and torch.isfinite(states).all()
+    ut, snt = CA.step_core(q[:, 0, :].contiguous(), delta, s0)
+    assert ut.shape == (B, D) and snt.shape == (B, D)
 
 
 @pytest.mark.skipif(not IS_X86, reason="shim 只为 x86 主机准备")

@@ -91,7 +91,19 @@ def get_threads() -> int:
 
 
 def recommended_threads() -> int:
-    """物理核数; C 侧探测失败时回退到逻辑核的一半。"""
+    """物理核数; C 侧探测失败时回退到逻辑核的一半。
+
+    big.LITTLE 设备上按大核数收敛 (解码线程落到小核会拖慢整条流水线),
+    非 ARM 平台该分支不生效。
+    """
+    try:
+        from ..kernels.arm import big_cores, is_arm
+        if is_arm():
+            big = big_cores()
+            if big:
+                return len(big)
+    except Exception:
+        pass
     lib = _load()
     if not hasattr(lib, "sn_recommended_threads"):
         return 0
@@ -100,6 +112,15 @@ def recommended_threads() -> int:
         import os
         n = max(1, (os.cpu_count() or 2) // 2)
     return n
+
+
+def pin_to_big_cores(threads: int = 0) -> list[int]:
+    """ARM 上把当前进程绑到大核; 其他平台空操作, 返回实际使用的 CPU 列表."""
+    try:
+        from ..kernels.arm import set_affinity
+        return set_affinity(threads=threads)
+    except Exception:
+        return []
 
 
 # 小模型权重随每步读完后驻留缓存, 并行无带宽收益、只多同步开销. 实测 (B=1, T=256,
@@ -129,6 +150,7 @@ class SnModel:
         if threads is None:
             threads = threads_for_blob(path)
         self.threads = set_threads(threads)
+        pin_to_big_cores(self.threads)
         load = self._lib.sn_load_h if half else self._lib.sn_load
         self._h = load(self._path, vocab, dim, inner, rank,
                        taps, layers, group, int(tied))

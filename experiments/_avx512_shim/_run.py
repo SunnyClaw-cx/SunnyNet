@@ -76,13 +76,52 @@ def ref_step_core(q, delta, s):
     return sn.reshape(B, D), u.reshape(B, D)
 
 
+def ref_core_bwd(q, delta, s0, dstate, du_in):
+    """参考: 用 torch autograd 对 core 的前向求导, 免手推反向公式."""
+    import torch
+    qq = torch.from_numpy(q.copy()).requires_grad_(True)
+    dd = torch.from_numpy(delta.copy()).requires_grad_(True)
+    ss = torch.from_numpy(s0.copy()).requires_grad_(True)
+    u, states = ref_core_fwd_torch(qq, dd, ss)
+    (u * torch.from_numpy(du_in.copy())
+     + states * torch.from_numpy(dstate.copy())).sum().backward()
+    return (qq.grad.numpy(), dd.grad.numpy(), ss.grad.numpy())
+
+
+def ref_core_fwd_torch(q, delta, s0):
+    """与 ref_core_fwd 同一式子, 但保持 torch 张量以支持 autograd."""
+    import torch
+    B, T, D2 = q.shape
+    D = D2 // 2
+    NG = D // 8
+    g = q[..., D:].reshape(B, T, NG, 8)
+    ur = q[..., :D].reshape(B, T, NG, 8)
+    dl = delta.reshape(NG, 8)
+    sig = torch.sigmoid(g)
+    w = torch.sigmoid(g - g.roll(-1, dims=-1)) * torch.sigmoid(g - g.roll(-2, dims=-1))
+    states = torch.empty(B, T, NG, 8, dtype=torch.float64)
+    us = torch.empty(B, T, NG, 8, dtype=torch.float64)
+    for b in range(B):
+        sb = s0[b].reshape(NG, 8)
+        for t in range(T):
+            u = ur[b, t] * w[b, t]
+            p = dl * sig[b, t] + (1.0 - dl)
+            sb = p * sb + (1.0 - p) * u
+            states[b, t], us[b, t] = sb, u
+    return us.reshape(B, T, D), states.reshape(B, T, D)
+
+
 def main() -> int:
     cc = sys.argv[1] if len(sys.argv) > 1 else "gcc"
     compile_shim(cc)
     lib = ctypes.CDLL(str(OUT))
     for fn, argt in (
+        ("core512_fwd_all_f32", [FL, FL, FL, FL, FL, FL, CI, CI, CI]),
+        ("core512_bwd_all_f32", [FL, FL, FL, FL, FL, FL, FL, FL, FL, FL, FL,
+                                 CI, CI, CI]),
         ("core512_fwd_f32", [FL, FL, FL, FL, FL, FL, CI, CI, CI]),
         ("core512_fwd_tail_f32", [FL, FL, FL, FL, FL, FL, CI, CI, CI, CI]),
+        ("step_core512_all_f32", [FL, FL, FL, FL, FL, CI, CI]),
         ("step_core512_f32", [FL, FL, FL, FL, FL, CI, CI]),
         ("step_core512_tail_f32", [FL, FL, FL, FL, FL, CI, CI, CI]),
         ("dw_step512_f32", [FL, FL, FL, FL, CI, CI, CI]),
@@ -95,7 +134,7 @@ def main() -> int:
                  "note": "只验证索引与语义; 真 AVX-512 指令吞吐未经真机验证"}
     TOL = 1e-5
 
-    # --- core fwd: NG 偶数 (全走 16 宽主循环) 与 NG 奇数 (补一次 8 宽尾部) ---
+    # --- core fwd: NG 偶数 (全走 16 宽主循环) 与 NG 奇数 (内部补 8 宽尾部) ---
     for D in (32, 24):
         B, T = 2, 5
         q = rng.standard_normal((B, T, 2 * D)).astype(np.float32)
@@ -104,21 +143,42 @@ def main() -> int:
         st = np.zeros((B, T, D), np.float32)
         uo = np.zeros((B, T, D), np.float32)
         po = np.zeros((B, T, D), np.float32)
-        NG, NP = D // 8, (D // 8) // 2
-        lib.core512_fwd_f32(q.ctypes.data_as(FL), delta.ctypes.data_as(FL),
-                            s0.ctypes.data_as(FL), st.ctypes.data_as(FL),
-                            uo.ctypes.data_as(FL), po.ctypes.data_as(FL), B, T, D)
-        if NG % 2:
-            lib.core512_fwd_tail_f32(q.ctypes.data_as(FL), delta.ctypes.data_as(FL),
-                                     s0.ctypes.data_as(FL), st.ctypes.data_as(FL),
-                                     uo.ctypes.data_as(FL), po.ctypes.data_as(FL),
-                                     B, T, D, NP * 2)
+        NG = D // 8
+        lib.core512_fwd_all_f32(q.ctypes.data_as(FL), delta.ctypes.data_as(FL),
+                                s0.ctypes.data_as(FL), st.ctypes.data_as(FL),
+                                uo.ctypes.data_as(FL), po.ctypes.data_as(FL), B, T, D)
         r_st, r_uo, r_po = ref_core_fwd(q, delta, s0)
         res[f"core_fwd_D{D}"] = {
             "ng": NG, "tail_used": bool(NG % 2),
             "maxdiff_states": float(np.abs(st - r_st).max()),
             "maxdiff_u": float(np.abs(uo - r_uo).max()),
             "maxdiff_p": float(np.abs(po - r_po).max())}
+
+    # --- core bwd: 与 torch autograd 对拍, 含 NG 奇数的尾部 group ---
+    for D in (32, 24):
+        B, T = 2, 5
+        q = rng.standard_normal((B, T, 2 * D)).astype(np.float32)
+        delta = rng.random((D,), dtype=np.float32)
+        s0 = rng.standard_normal((B, D)).astype(np.float32)
+        st, uo, po = ref_core_fwd(q, delta, s0)
+        dst = rng.standard_normal((B, T, D)).astype(np.float32)
+        du_in = rng.standard_normal((B, T, D)).astype(np.float32)
+        dq = np.zeros((B, T, 2 * D), np.float32)
+        ddelta = np.zeros((D,), np.float32)
+        ds0 = np.zeros((B, D), np.float32)
+        lib.core512_bwd_all_f32(
+            q.ctypes.data_as(FL), delta.ctypes.data_as(FL), s0.ctypes.data_as(FL),
+            st.astype(np.float32).ctypes.data_as(FL), uo.astype(np.float32).ctypes.data_as(FL),
+            po.astype(np.float32).ctypes.data_as(FL),
+            dst.ctypes.data_as(FL), du_in.ctypes.data_as(FL),
+            dq.ctypes.data_as(FL), ddelta.ctypes.data_as(FL), ds0.ctypes.data_as(FL),
+            B, T, D)
+        r_dq, r_ddelta, r_ds0 = ref_core_bwd(q, delta, s0, dst, du_in)
+        res[f"core_bwd_D{D}"] = {
+            "ng": D // 8, "tail_used": bool((D // 8) % 2),
+            "maxdiff_dq": float(np.abs(dq - r_dq).max()),
+            "maxdiff_ddelta": float(np.abs(ddelta - r_ddelta).max()),
+            "maxdiff_ds0": float(np.abs(ds0 - r_ds0).max())}
 
     # --- step core ---
     for D in (32, 24):
@@ -128,14 +188,10 @@ def main() -> int:
         s = rng.standard_normal((B, D)).astype(np.float32)
         sn = np.zeros((B, D), np.float32)
         us = np.zeros((B, D), np.float32)
-        NG, NP = D // 8, (D // 8) // 2
-        lib.step_core512_f32(q.ctypes.data_as(FL), delta.ctypes.data_as(FL),
-                             s.ctypes.data_as(FL), sn.ctypes.data_as(FL),
-                             us.ctypes.data_as(FL), B, D)
-        if NG % 2:
-            lib.step_core512_tail_f32(q.ctypes.data_as(FL), delta.ctypes.data_as(FL),
-                                      s.ctypes.data_as(FL), sn.ctypes.data_as(FL),
-                                      us.ctypes.data_as(FL), B, D, NP * 2)
+        NG = D // 8
+        lib.step_core512_all_f32(q.ctypes.data_as(FL), delta.ctypes.data_as(FL),
+                                 s.ctypes.data_as(FL), sn.ctypes.data_as(FL),
+                                 us.ctypes.data_as(FL), B, D)
         r_sn, r_us = ref_step_core(q, delta, s)
         res[f"step_core_D{D}"] = {
             "ng": NG, "tail_used": bool(NG % 2),

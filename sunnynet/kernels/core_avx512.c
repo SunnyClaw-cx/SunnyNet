@@ -46,7 +46,7 @@ static inline __m512 expv16(__m512 x) {
     return _mm512_loadu_ps(a);
 }
 
-/* 忽略尾部掩码: 只对满 16 宽度的块调用, 收尾走标量. */
+/* 忽略尾部掩码: 只对满 16 宽度的块调用, 收尾走 core512_fwd_tail_f32. */
 EXPORT void core512_fwd_f32(const float* q, const float* delta, const float* s0,
                             float* states, float* uo, float* po,
                             int B, int T, int D) {
@@ -205,6 +205,105 @@ EXPORT void core512_bwd_f32(const float* q, const float* delta, const float* s0,
             }
         }
     }
+}
+
+/* NG 为奇数时的单个 group 收尾 (8 元素), 语义同 core_bwd_f32. */
+EXPORT void core512_bwd_tail_f32(const float* q, const float* delta,
+                                 const float* s0, const float* states,
+                                 const float* uo, const float* po,
+                                 const float* dstate, const float* du_in,
+                                 float* dq, float* ddelta, float* ds0,
+                                 int B, int T, int D, int gstart) {
+    const __m256i il1 = _mm256_setr_epi32(1, 2, 3, 4, 5, 6, 7, 0);
+    const __m256i il2 = _mm256_setr_epi32(2, 3, 4, 5, 6, 7, 0, 1);
+    const __m256i ir1 = _mm256_setr_epi32(7, 0, 1, 2, 3, 4, 5, 6);
+    const __m256i ir2 = _mm256_setr_epi32(6, 7, 0, 1, 2, 3, 4, 5);
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 zero = _mm256_setzero_ps();
+    for (int b = 0; b < B; ++b) {
+        for (int g = gstart; g < (D >> 3); ++g) {
+            const int d0 = g << 3;
+            const size_t qb = (size_t)b * T * 2 * D;
+            const size_t sb = (size_t)b * T * D;
+            const float* s0b = s0 + (size_t)b * D + d0;
+            __m256 dl = _mm256_loadu_ps(delta + d0);
+            __m256 dacc = _mm256_setzero_ps();
+            __m256 ds = _mm256_setzero_ps();
+            for (int t = T - 1; t >= 0; --t) {
+                const size_t qoff = qb + (size_t)t * 2 * D + d0;
+                const size_t off = sb + (size_t)t * D + d0;
+                ds = _mm256_add_ps(ds, _mm256_loadu_ps(dstate + off));
+                __m256 u = _mm256_loadu_ps(uo + off);
+                __m256 p = _mm256_loadu_ps(po + off);
+                __m256 sprev = (t > 0) ? _mm256_loadu_ps(states + off - D)
+                                       : _mm256_loadu_ps(s0b);
+                __m256 dp = _mm256_mul_ps(ds, _mm256_sub_ps(sprev, u));
+                __m256 du = _mm256_fmadd_ps(ds, _mm256_sub_ps(one, p),
+                                            _mm256_loadu_ps(du_in + off));
+                ds = _mm256_mul_ps(ds, p);
+
+                __m256 ur = _mm256_loadu_ps(q + qoff);
+                __m256 gt = _mm256_loadu_ps(q + qoff + D);
+                float tmp[8];
+                _mm256_storeu_ps(tmp, _mm256_sub_ps(zero, gt));
+                for (int i = 0; i < 8; ++i) tmp[i] = expf(tmp[i]);
+                __m256 e = _mm256_loadu_ps(tmp);
+                __m256 e1 = _mm256_permutevar8x32_ps(e, il1);
+                __m256 e2 = _mm256_permutevar8x32_ps(e, il2);
+                __m256 sig = _mm256_div_ps(one, _mm256_add_ps(one, e));
+                __m256 s1 = _mm256_div_ps(one, _mm256_add_ps(one, _mm256_div_ps(e, e1)));
+                __m256 s2 = _mm256_div_ps(one, _mm256_add_ps(one, _mm256_div_ps(e, e2)));
+                __m256 w = _mm256_mul_ps(s1, s2);
+
+                __m256 dur = _mm256_mul_ps(du, w);
+                __m256 dw = _mm256_mul_ps(du, ur);
+                __m256 ds1 = _mm256_mul_ps(dw, s2);
+                __m256 ds2 = _mm256_mul_ps(dw, s1);
+                __m256 a1 = _mm256_mul_ps(ds1, _mm256_mul_ps(s1, _mm256_sub_ps(one, s1)));
+                __m256 a2 = _mm256_mul_ps(ds2, _mm256_mul_ps(s2, _mm256_sub_ps(one, s2)));
+                __m256 dg = _mm256_add_ps(a1, a2);
+                dg = _mm256_sub_ps(dg, _mm256_permutevar8x32_ps(a1, ir1));
+                dg = _mm256_sub_ps(dg, _mm256_permutevar8x32_ps(a2, ir2));
+                dg = _mm256_fmadd_ps(_mm256_mul_ps(dp, dl),
+                                     _mm256_mul_ps(sig, _mm256_sub_ps(one, sig)), dg);
+                dacc = _mm256_fmadd_ps(dp, _mm256_sub_ps(sig, one), dacc);
+
+                _mm256_storeu_ps(dq + qoff, dur);
+                _mm256_storeu_ps(dq + qoff + D, dg);
+            }
+            _mm256_storeu_ps(ds0 + (size_t)b * D + d0, ds);
+            float t2[8];
+            _mm256_storeu_ps(t2, dacc);
+            for (int i = 0; i < 8; ++i) {
+                #pragma omp atomic
+                ddelta[d0 + i] += t2[i];
+            }
+        }
+    }
+}
+
+/* 整段前向: 内部处理 NG 为奇数时的收尾, 调用方不必自己分两次调. */
+EXPORT void core512_fwd_all_f32(const float* q, const float* delta, const float* s0,
+                                float* states, float* uo, float* po,
+                                int B, int T, int D) {
+    const int NG = D >> 3;
+    core512_fwd_f32(q, delta, s0, states, uo, po, B, T, D);
+    if (NG & 1)
+        core512_fwd_tail_f32(q, delta, s0, states, uo, po, B, T, D, NG - 1);
+}
+
+/* 整段反向: 内部处理 NG 为奇数时的收尾. */
+EXPORT void core512_bwd_all_f32(const float* q, const float* delta, const float* s0,
+                                const float* states, const float* uo, const float* po,
+                                const float* dstate, const float* du_in,
+                                float* dq, float* ddelta, float* ds0,
+                                int B, int T, int D) {
+    const int NG = D >> 3;
+    core512_bwd_f32(q, delta, s0, states, uo, po, dstate, du_in,
+                    dq, ddelta, ds0, B, T, D);
+    if (NG & 1)
+        core512_bwd_tail_f32(q, delta, s0, states, uo, po, dstate, du_in,
+                             dq, ddelta, ds0, B, T, D, NG - 1);
 }
 
 /* 运行期探测: 本库需 CPU 支持 AVX512F, 否则调用会触发非法指令. */
