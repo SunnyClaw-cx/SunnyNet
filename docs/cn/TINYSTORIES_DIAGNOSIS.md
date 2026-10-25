@@ -76,7 +76,8 @@ karpathy 一行为本次实测：从其 checkpoint config 读出 128×4×256×29
 ## 4. 跨架构对照（同数据 / 同分词器 / 同步数）
 
 TinyStories-valid 故事级切分、修复后分词器、3000 步 × B=8 × T=256 = 6.14M token、
-栈参数对齐 ~365k（`small` 预设 1.41M 总参数）。指标 BPC。
+栈参数对齐 ~365k（`small` 预设 1.41M 总参数）。指标 BPC。七格同一学习率 3e-3、
+同一 warmup 与 cosine 调度，无架构专属超参。
 
 | 架构 | 总参数量 | val ppl | **BPC** | tok/param |
 |---|---|---|---|---|
@@ -85,17 +86,41 @@ TinyStories-valid 故事级切分、修复后分词器、3000 步 × B=8 × T=25
 | **SunnyNet** | 1,414,420 | 6.111 | 1.1458 | 4.34 |
 | H3 | 1,206,608 | 6.239 | 1.1584 | 5.09 |
 | Hyena | 1,286,992 | 6.362 | 1.1750 | 4.77 |
-| Transformer | 1,270,320 | 7.467 | 1.2692 | 4.84 |
+| Transformer | 1,270,320 | 7.161 | 1.2478 | 4.84 |
 | Linear-Attn | 1,160,544 | 7.992 | 1.3076 | 5.29 |
 
 读数：
 
 - **SunnyNet 位列第三**，落后 RWKV 1.8%、Mamba 0.9%，领先 H3 1.1%、Hyena 2.5%。
-- **在同预算同栈参数下优于 Transformer**（1.1458 vs 1.2692，低 9.7%）——
+  该排序经第二种子复核后稳定（§4.1）。
+- **在同预算同栈参数下优于 Transformer**（1.1458 vs 1.2478，低 8.2%）——
   Transformer 在此规模反而排在 SunnyNet 之后，与"线性架构打不过注意力"的直觉相反；
   该差异来自 6.14M token 的极低预算，不代表大规模结论。
-- SunnyNet 的 tok/param（4.34）低于 rwkv/mamba（5.31/5.65），
+- **七个架构用同一个学习率（3e-3）**，无架构专属超参。Transformer 曾单独用 6e-3，
+  实测把它换成与其余六格一致的 3e-3 后其 BPC 由 1.2692 降到 **1.2478**——
+  即特殊学习率对 Transformer 不利，统一后 SunnyNet 的相对领先由 9.7% 收窄为 8.2%。
+  SunnyNet 侧对学习率不敏感（3e-3 与 6e-3 相差 0.3%）。两格各为独立 3000 步运行。
+- **SunnyNet 的 tok/param（4.34）低于 rwkv/mamba（5.31/5.65）**，
   即它在更少的 token 预算下取得了相近的 BPC。
+
+### 4.1 中段排名的种子稳定性
+
+主表每格是单种子读数，而中段相邻架构的 BPC 间距只有 0.9%–1.6%，排序可能落在种子噪声内。
+给中段四架构各补跑第二个种子（seed=7，统一 lr=3e-3）：
+
+| 架构 | seed 1234 | seed 7 | 均值 | 极差 |
+|---|---|---|---|---|
+| RWKV | 1.1251 | 1.1170 | 1.1210 | 0.72% |
+| Mamba | 1.1350 | 1.1282 | 1.1316 | 0.60% |
+| **SunnyNet** | 1.1458 | 1.1389 | **1.1423** | 0.60% |
+| H3 | 1.1584 | 1.1541 | 1.1562 | 0.37% |
+
+- 每种架构两种子的极差 **≤0.72%**，小于相邻架构的均值差（0.93%–1.20%）。
+- 相邻架构的两种子取值区间**无重叠**：RWKV 上限 1.1251 < Mamba 下限 1.1282；
+  Mamba 上限 1.1350 < SunnyNet 下限 1.1389；SunnyNet 上限 1.1458 < H3 下限 1.1541。
+- 结论：中段排序在种子扰动下稳定，**SunnyNet 位列第三**不是单种子的偶然。
+- 口径边界：两种子只给出极差，**不构成统计置信区间**；Hyena / Transformer / Linear-Attn
+  未补第二种子，其与 H3 的间距（≥1.6%）未做同样的稳定性检验。
 
 **口径边界**：七格训练到 6.14M token 即停止，远未收敛；只作同预算下的
 相对定位，不得外推为最终质量。跨架构参数按栈参数对齐（非 embedding），
@@ -141,6 +166,16 @@ python -X utf8 experiments/_tiny_bench.py --tok fixed_en  --arch sunnynet --step
 
 # 跨架构
 python -X utf8 experiments/_tiny_bench.py --tok fixed_en --arch {transformer,rwkv,mamba,linear_attn,hyena,h3}
+
+# 学习率敏感性（--force-lr 覆盖按架构的默认值，七格统一 3e-3）
+python -X utf8 experiments/_tiny_bench.py --tok fixed_en --arch transformer --force-lr 3e-3
+
+# 中段排名的种子稳定性（每格独立子进程串行跑，避免线程超订 segfault）
+for a in rwkv mamba sunnynet h3; do
+  python -X utf8 experiments/_tiny_bench.py --tok fixed_en --arch $a --seed 7 --steps 3000 \
+      --out results/tiny/ms_${a}_s7.json
+done
+python -X utf8 experiments/_tiny_seed_agg.py
 ```
 
 ## 8. 口径边界
@@ -148,5 +183,10 @@ python -X utf8 experiments/_tiny_bench.py --tok fixed_en --arch {transformer,rwk
 - 上述对照训练到 6.14M token，**远未收敛**；只读作同预算下的相对优劣，
   不得外推为最终质量。
 - BPC 依赖字符数统计，不同数据切分会有微小差异；本次两格用同一验证集。
-- 跨架构对照的参数按"栈参数"对齐（非 embedding），层数未强制一致。
-- 未做多种子重复，单次读数只作方向性证据。
+- 跨架构对照的参数按"栈参数"对齐（非 embedding），层数未强制一致：
+  Transformer 为 6 层，SunnyNet 与其余线性架构为 4 层。该不对称**偏向 Transformer**（更深）；
+  它仍在同预算下落后，故 SunnyNet 的领先不依赖层数占优。
+- 中段四架构（RWKV/Mamba/SunnyNet/H3）各跑两个种子，极差 ≤0.72%（§4.1）；
+  其余三格仍为单种子。两种子只给极差，不构成统计置信区间。
+- 七格用同一学习率，但**各架构的最优学习率未逐格搜索**；表中数字是"同一超参下的"
+  相对表现，不是各架构调参后的上限。

@@ -135,6 +135,8 @@ def main():
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--seq-len", type=int, default=256)
     ap.add_argument("--lr", type=float, default=3e-3)
+    ap.add_argument("--force-lr", type=float, default=0.0,
+                    help="覆盖按架构写死的 lr, 用于跨架构 lr 扫描")
     ap.add_argument("--warmup", type=int, default=100)
     ap.add_argument("--threads", type=int, default=6)
     ap.add_argument("--seed", type=int, default=1234)
@@ -173,7 +175,7 @@ def main():
     val_b = Stream(va, args.seq_len, args.batch_size, seed=1).fixed(8)
     val_chars = sum(len(s) for s in va_s)
 
-    mlu = {"sunnynet": args.lr, "transformer": 6e-3}.get(args.arch, 3e-3)
+    mlu = args.force_lr if args.force_lr > 0 else args.lr
     opt = torch.optim.AdamW(model.parameters(), lr=mlu, betas=(0.9, 0.95),
                             weight_decay=0.01)
 
@@ -206,6 +208,7 @@ def main():
     final_bpc = evaluate_bpc(model, va, val_chars, args.seq_len)
     print(f"  [bpc] {final_bpc:.4f} bits/char  (chars/tok={sum(len(s) for s in va_s)/max(1,va.size):.3f})")
     summary = {"tok": args.tok, "arch": args.arch, "preset": args.preset,
+               "lr": mlu,
                "params": n_all, "params_non_embed": n_ne, "vocab": tk.vocab_size,
                "steps": args.steps, "tokens_trained": args.steps * args.batch_size * args.seq_len,
                "val_tokens": int(va.size), "val_chars": val_chars,
