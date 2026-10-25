@@ -122,7 +122,8 @@ def _preset_cfg(preset: str, vocab: int) -> SunnyConfig:
 
 
 def build_models(arch: str, vocab: int, preset: str, ablation: dict | None,
-                 seq_len: int, seed: int, h_max: float = 0.0):
+                 seq_len: int, seed: int, h_max: float = 0.0,
+                 base_layers: int = 0):
     torch.manual_seed(seed)
     sunny_cfg = _preset_cfg(preset, vocab)
     if h_max > 0:
@@ -137,7 +138,8 @@ def build_models(arch: str, vocab: int, preset: str, ablation: dict | None,
 
     target = sunny.num_params(non_embedding=True)
     if arch == "transformer":
-        bcfg, bn, rel = solve_baseline_for_params(target, vocab, n_layers=6, n_heads=8,
+        tl = base_layers or 6
+        bcfg, bn, rel = solve_baseline_for_params(target, vocab, n_layers=tl, n_heads=8,
                                                   max_len=max(seq_len, 2048))
         base = TransformerLM(bcfg)
     else:

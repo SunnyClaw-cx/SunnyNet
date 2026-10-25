@@ -137,6 +137,8 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-3)
     ap.add_argument("--force-lr", type=float, default=0.0,
                     help="覆盖按架构写死的 lr, 用于跨架构 lr 扫描")
+    ap.add_argument("--base-layers", type=int, default=0,
+                    help="覆盖基线架构层数 (0=用默认); transformer 默认 6, 其余 4")
     ap.add_argument("--warmup", type=int, default=100)
     ap.add_argument("--threads", type=int, default=6)
     ap.add_argument("--seed", type=int, default=1234)
@@ -165,7 +167,8 @@ def main():
 
     import train as T
     sunny, base, cfg = T.build_models(args.arch, VOCAB, args.preset, None,
-                                      args.seq_len, args.seed)
+                                      args.seq_len, args.seed,
+                                      base_layers=args.base_layers)
     model = sunny if args.arch == "sunnynet" else base
     n_all = model.num_params()
     n_ne = model.num_params(non_embedding=True)

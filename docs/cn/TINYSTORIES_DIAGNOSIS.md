@@ -96,6 +96,8 @@ TinyStories-valid 故事级切分、修复后分词器、3000 步 × B=8 × T=25
 - **在同预算同栈参数下优于 Transformer**（1.1458 vs 1.2478，低 8.2%）——
   Transformer 在此规模反而排在 SunnyNet 之后，与"线性架构打不过注意力"的直觉相反；
   该差异来自 6.14M token 的极低预算，不代表大规模结论。
+  两处不对称都偏向 Transformer：它用 6 层（SunnyNet 4 层），且压到 4 层后更差（1.3106）；
+  它与 SunnyNet 的栈参数对齐到 0.06% 以内。
 - **七个架构用同一个学习率（3e-3）**，无架构专属超参。Transformer 曾单独用 6e-3，
   实测把它换成与其余六格一致的 3e-3 后其 BPC 由 1.2692 降到 **1.2478**——
   即特殊学习率对 Transformer 不利，统一后 SunnyNet 的相对领先由 9.7% 收窄为 8.2%。
@@ -124,7 +126,7 @@ TinyStories-valid 故事级切分、修复后分词器、3000 步 × B=8 × T=25
 
 **口径边界**：七格训练到 6.14M token 即停止，远未收敛；只作同预算下的
 相对定位，不得外推为最终质量。跨架构参数按栈参数对齐（非 embedding），
-层数未强制一致。单种子单次读数。
+中段四架构各有两个种子（§4.1），其余三格单种子。
 
 ## 5. 与公开 TinyStories 模型的对照口径
 
@@ -170,6 +172,9 @@ python -X utf8 experiments/_tiny_bench.py --tok fixed_en --arch {transformer,rwk
 # 学习率敏感性（--force-lr 覆盖按架构的默认值，七格统一 3e-3）
 python -X utf8 experiments/_tiny_bench.py --tok fixed_en --arch transformer --force-lr 3e-3
 
+# 层数敏感性（--base-layers 让 transformer 与 SunnyNet 同为 4 层，自动加宽对齐栈参数）
+python -X utf8 experiments/_tiny_bench.py --tok fixed_en --arch transformer --base-layers 4
+
 # 中段排名的种子稳定性（每格独立子进程串行跑，避免线程超订 segfault）
 for a in rwkv mamba sunnynet h3; do
   python -X utf8 experiments/_tiny_bench.py --tok fixed_en --arch $a --seed 7 --steps 3000 \
@@ -184,8 +189,9 @@ python -X utf8 experiments/_tiny_seed_agg.py
   不得外推为最终质量。
 - BPC 依赖字符数统计，不同数据切分会有微小差异；本次两格用同一验证集。
 - 跨架构对照的参数按"栈参数"对齐（非 embedding），层数未强制一致：
-  Transformer 为 6 层，SunnyNet 与其余线性架构为 4 层。该不对称**偏向 Transformer**（更深）；
-  它仍在同预算下落后，故 SunnyNet 的领先不依赖层数占优。
+  Transformer 为 6 层，SunnyNet 与其余线性架构为 4 层。该不对称**偏向 Transformer**——
+  实测把 Transformer 压到 4 层（栈参数对齐后自动加宽到 d120），其 BPC 由 1.2478 退化到
+  **1.3106**，即 6 层对它更有利。它仍在同预算下落后，故 SunnyNet 的领先不依赖层数占优。
 - 中段四架构（RWKV/Mamba/SunnyNet/H3）各跑两个种子，极差 ≤0.72%（§4.1）；
   其余三格仍为单种子。两种子只给极差，不构成统计置信区间。
 - 七格用同一学习率，但**各架构的最优学习率未逐格搜索**；表中数字是"同一超参下的"
