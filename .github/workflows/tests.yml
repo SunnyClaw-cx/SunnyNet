@@ -26,28 +26,25 @@ jobs:
       - name: Architecture self-check
         shell: bash
         run: |
-          python -c "import sys,torch,numpy;print('::notice::py=%s torch=%s numpy=%s gcc=%s'%(sys.version.split()[0],torch.__version__,numpy.__version__, __import__('shutil').which('gcc') or 'none'))"
-          set -o pipefail
+          python -c "import sys,torch,numpy;print('::notice::py=%s torch=%s numpy=%s gcc=%s'%(sys.version.split()[0],torch.__version__,numpy.__version__, __import__('shutil').which('gcc') or 'none'))" || true
+          # shell 默认 -e, 叠加 pipefail 会让 pytest 失败直接终止脚本, 后面的
+          # 摘要与注解都执行不到。这里临时关掉 -e 收下退出码。
+          set +e
           pytest tests/ -q --tb=short -rf --color=no 2>&1 | tee "$RUNNER_TEMP/pytest.log"
           rc=${PIPESTATUS[0]}
+          set -e
           if [ "$rc" -ne 0 ]; then
+            sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' "$RUNNER_TEMP/pytest.log" > "$RUNNER_TEMP/plain.log"
             {
               echo "### architecture-selfcheck (${{ matrix.os }}, ${{ matrix.python-version }})"
               echo
               echo '```'
-              tail -200 "$RUNNER_TEMP/pytest.log"
+              tail -60 "$RUNNER_TEMP/plain.log"
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
-            # pytest 检测到 GITHUB_ACTIONS 会强制上色; 崩溃时无 FAILED 行, 改取尾部
-            sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' "$RUNNER_TEMP/pytest.log" > "$RUNNER_TEMP/plain.log"
-            report=$(grep -E "^FAILED|^ERROR" "$RUNNER_TEMP/plain.log" | head -10)
-            if [ -z "$report" ]; then
-              report=$(tail -10 "$RUNNER_TEMP/plain.log")
-            fi
-            printf '%s\n' "$report" | while IFS= read -r line; do
-              [ -z "$line" ] && continue
-              echo "::error::${{ matrix.os }}/py${{ matrix.python-version }} rc=$rc | $line"
-            done
+            grep -E "^FAILED|^ERROR" "$RUNNER_TEMP/plain.log" | head -20 | while IFS= read -r line; do
+              echo "::error::${{ matrix.os }}/py${{ matrix.python-version }} | $line"
+            done || true
           fi
           exit "$rc"
 
