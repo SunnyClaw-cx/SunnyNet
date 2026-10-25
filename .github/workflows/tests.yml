@@ -26,8 +26,9 @@ jobs:
       - name: Architecture self-check
         shell: bash
         run: |
+          python -c "import sys,torch,numpy;print('::notice::py=%s torch=%s numpy=%s gcc=%s'%(sys.version.split()[0],torch.__version__,numpy.__version__, __import__('shutil').which('gcc') or 'none'))"
           set -o pipefail
-          pytest tests/ -q --tb=short -rf 2>&1 | tee "$RUNNER_TEMP/pytest.log"
+          pytest tests/ -q --tb=short -rf --color=no 2>&1 | tee "$RUNNER_TEMP/pytest.log"
           rc=${PIPESTATUS[0]}
           if [ "$rc" -ne 0 ]; then
             {
@@ -37,7 +38,6 @@ jobs:
               tail -200 "$RUNNER_TEMP/pytest.log"
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
-            # 注解经 annotations API 公开可读, 无需仓库 admin
             grep -E "^FAILED|^ERROR" "$RUNNER_TEMP/pytest.log" | head -20 | while IFS= read -r line; do
               echo "::error::${{ matrix.os }}/py${{ matrix.python-version }} $line"
             done
