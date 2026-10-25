@@ -112,6 +112,8 @@ def main():
                     help="每个故事截断到的字符数, 所有模型必须一致")
     ap.add_argument("--threads", type=int, default=6)
     ap.add_argument("--trust-remote", action="store_true")
+    ap.add_argument("--slow-tok", action="store_true",
+                    help="缺 tokenizer.json 时走 vocab.json + merges.txt 的 slow 路径")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
@@ -125,7 +127,7 @@ def main():
         tok = SPAdapter(sp_path)
         kw["local_files_only"] = True
     else:
-        tok = AutoTokenizer.from_pretrained(args.model, **kw)
+        tok = AutoTokenizer.from_pretrained(args.model, use_fast=not args.slow_tok, **kw)
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32, **kw)
     model.eval()
     n_par = sum(p.numel() for p in model.parameters())

@@ -57,14 +57,18 @@ B=8、T=256 = 6.14M token 训练。评测用 **BPC（bits-per-character）**—�
 
 | 模型 | 参数量 | tokens seen |
 |---|---|---|
-| karpathy `stories15M` | 15.2M | ~1B |
+| karpathy `stories15M` | 15.2M | **39.0B** |
 | `child-12m` | 12.3M | ~1.0B |
 | `syrinx-10m` | 11.8M | 0.29B |
 | `Compactbot/tinystories-24m` | 24.6M | 0.45B |
 
+karpathy 一行为本次实测：从其 checkpoint config 读出 128×4×256×298000 = **39.0B**，
+不是早前估值。其余三行来自各自 model card，未逐条核验。
+
 对照报告的场景：20000 步 × B8 × T256 = **41M token**（1.41M 模型上约 29 token/参数）。
-即使按 B16/T512 也只有 164M token，仍与 ~1B 差 6× 以上。**这是"两万步仍不会写故事"
-的另一半原因。**
+即使按 B16/T512 也只有 164M token，与 `stories15M` 的 39.0B 差两个数量级以上，
+与 TinyStories 论文系列（单张 V100 ≤30 小时）也差一个数量级。
+**这是"两万步仍不会写故事"的另一半原因。**
 
 同预算下其他架构也做不到长距连贯——对照实验（`experiments/_tiny_bench.py`）
 见下节。
@@ -104,14 +108,15 @@ TinyStories-valid 故事级切分、修复后分词器、3000 步 × B=8 × T=25
 
 | 模型 | 参数量 | tokens seen | tokenizer | val ppl |
 |---|---|---|---|---|
-| karpathy `stories15M` | 15.2M | ~1B | Llama-2 32K BPE | 2.92 |
+| karpathy `stories15M` | 15.2M | **39.0B** | Llama-2 32K BPE | 2.92 |
 | `child-12m` | 12.3M | ~1.0B | 8K custom BPE | 3.45 |
 | `pluto-15M` | 15M | ~1B | — | ~3.64 |
 | `syrinx-10m` | 11.8M | 0.29B | 32K byte-BPE | 4.78 |
 | `Compactbot/tinystories-24m` | 24.6M | 0.45B | 8K BPE | 8.76 |
 | **本项目 SunnyNet（本次对照）** | 1.41M | **0.006B** | 8K BPE | 6.111 |
 
-上表最后一行与其余各行**不在同一预算量级**（差 50–170×），列于此只为说明
+karpathy 一行为实测（checkpoint config），其余来自各自 model card。上表最后一行与
+其余各行**不在同一预算量级**（与 karpathy 差 6000× 以上，与其余差 50–170×），列于此只为说明
 差距来源。跨分词器比较 ppl 无效，必须转 BPC 或 bits-per-byte。
 
 ## 6. 建议
