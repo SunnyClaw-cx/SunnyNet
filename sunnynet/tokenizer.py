@@ -110,6 +110,13 @@ class BPETokenizer:
                     heapq.heappush(heap, (-cur, pair))
                 continue
             a, b = pair
+            if not any(ids[i] == a and ids[i + 1] == b
+                       for si in pair_seqs.get(pair, ())
+                       for ids in (seqs[si],)
+                       for i in range(len(ids) - 1)):
+                pair_counts.pop(pair, None)
+                pair_seqs.pop(pair, None)
+                continue
             new_id = len(vocab)
             tok = f"<m{new_id}>"
             vocab[tok] = new_id
@@ -130,20 +137,23 @@ class BPETokenizer:
                         i += 1
                 if not changed:
                     continue
-                old_pairs = set(zip(ids, ids[1:]))
+                # 计数必须按出现次数增删; 用 set 去重会让高频对永远减不到 0,
+                # 同一对反复写入 merges, 词表被解码等价的重复 token 占满.
+                old = Counter(zip(ids, ids[1:]))
+                new = Counter(zip(out, out[1:]))
                 seqs[si] = out
-                for p in old_pairs:
-                    if pair_counts.get(p, 0) > 0:
-                        pair_counts[p] = max(0, pair_counts[p] - f)
-                        if pair_counts[p] > 0:
-                            heapq.heappush(heap, (-pair_counts[p], p))
-                        else:
-                            pair_counts.pop(p, None)
-                    pair_seqs.get(p, set()).discard(si)
-                for p in zip(out, out[1:]):
-                    pair_counts[p] = pair_counts.get(p, 0) + f
+                for p in set(old) | set(new):
+                    c = pair_counts.get(p, 0) + f * (new.get(p, 0) - old.get(p, 0))
+                    if c > 0:
+                        pair_counts[p] = c
+                        heapq.heappush(heap, (-c, p))
+                    else:
+                        pair_counts.pop(p, None)
+                for p in old:
+                    if p not in new:
+                        pair_seqs.get(p, set()).discard(si)
+                for p in new:
                     pair_seqs[p].add(si)
-                    heapq.heappush(heap, (-pair_counts[p], p))
             pair_seqs.pop(pair, None)
 
             if verbose and len(merges) % 1000 == 0:
