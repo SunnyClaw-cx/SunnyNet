@@ -37,6 +37,10 @@ jobs:
               tail -200 "$RUNNER_TEMP/pytest.log"
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
+            # 注解经 annotations API 公开可读, 无需仓库 admin
+            grep -E "^FAILED|^ERROR" "$RUNNER_TEMP/pytest.log" | head -20 | while IFS= read -r line; do
+              echo "::error::${{ matrix.os }}/py${{ matrix.python-version }} $line"
+            done
           fi
           exit "$rc"
 
