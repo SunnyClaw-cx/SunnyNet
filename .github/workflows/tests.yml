@@ -38,8 +38,15 @@ jobs:
               tail -200 "$RUNNER_TEMP/pytest.log"
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
-            grep -E "^FAILED|^ERROR" "$RUNNER_TEMP/pytest.log" | head -20 | while IFS= read -r line; do
-              echo "::error::${{ matrix.os }}/py${{ matrix.python-version }} $line"
+            # pytest 检测到 GITHUB_ACTIONS 会强制上色; 崩溃时无 FAILED 行, 改取尾部
+            sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' "$RUNNER_TEMP/pytest.log" > "$RUNNER_TEMP/plain.log"
+            report=$(grep -E "^FAILED|^ERROR" "$RUNNER_TEMP/plain.log" | head -10)
+            if [ -z "$report" ]; then
+              report=$(tail -10 "$RUNNER_TEMP/plain.log")
+            fi
+            printf '%s\n' "$report" | while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              echo "::error::${{ matrix.os }}/py${{ matrix.python-version }} rc=$rc | $line"
             done
           fi
           exit "$rc"
