@@ -178,19 +178,21 @@ def load_avx512_core(force_rebuild: bool = False):
             (HERE / "step_avx512.c").stat().st_mtime > dll.stat().st_mtime:
         dll = _compile_avx512_core(gcc)
     lib = ctypes.CDLL(str(dll))
-    F, I, P = ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_char_p
+    # 指针参数绑 c_void_p: core_auto 与 AVX2 路径一样传 data_ptr() 整数,
+    # POINTER(c_float) 只接受 ctypes 指针对象, 传整数会 ArgumentError。
+    V, I, P = ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p
     lib.sn512_isa.restype = P
     lib.sn512_set_threads.argtypes = [I]
-    lib.core512_fwd_all_f32.argtypes = [F, F, F, F, F, F, I, I, I]
-    lib.core512_bwd_all_f32.argtypes = [F, F, F, F, F, F, F, F, F, F, F, I, I, I]
-    lib.core512_fwd_f32.argtypes = [F, F, F, F, F, F, I, I, I]
-    lib.core512_bwd_f32.argtypes = [F, F, F, F, F, F, F, F, F, F, F, I, I, I]
-    lib.core512_fwd_tail_f32.argtypes = [F, F, F, F, F, F, I, I, I, I]
-    lib.core512_bwd_tail_f32.argtypes = [F, F, F, F, F, F, F, F, F, F, F, I, I, I, I]
-    lib.step_core512_all_f32.argtypes = [F, F, F, F, F, I, I]
-    lib.step_core512_f32.argtypes = [F, F, F, F, F, I, I]
-    lib.step_core512_tail_f32.argtypes = [F, F, F, F, F, I, I, I]
-    lib.dw_step512_f32.argtypes = [F, F, F, F, I, I, I]
+    lib.core512_fwd_all_f32.argtypes = [V, V, V, V, V, V, I, I, I]
+    lib.core512_bwd_all_f32.argtypes = [V, V, V, V, V, V, V, V, V, V, V, I, I, I]
+    lib.core512_fwd_f32.argtypes = [V, V, V, V, V, V, I, I, I]
+    lib.core512_bwd_f32.argtypes = [V, V, V, V, V, V, V, V, V, V, V, I, I, I]
+    lib.core512_fwd_tail_f32.argtypes = [V, V, V, V, V, V, I, I, I, I]
+    lib.core512_bwd_tail_f32.argtypes = [V, V, V, V, V, V, V, V, V, V, V, I, I, I, I]
+    lib.step_core512_all_f32.argtypes = [V, V, V, V, V, I, I]
+    lib.step_core512_f32.argtypes = [V, V, V, V, V, I, I]
+    lib.step_core512_tail_f32.argtypes = [V, V, V, V, V, I, I, I]
+    lib.dw_step512_f32.argtypes = [V, V, V, V, I, I, I]
     _lib512_core = lib
     return lib
 
