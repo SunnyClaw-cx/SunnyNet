@@ -26,14 +26,14 @@ jobs:
       - name: Architecture self-check
         shell: bash
         run: |
-          python -c "import sys,torch,numpy;print('::notice::py=%s torch=%s numpy=%s gcc=%s'%(sys.version.split()[0],torch.__version__,numpy.__version__, __import__('shutil').which('gcc') or 'none'))" || true
-          # shell 默认 -e, 叠加 pipefail 会让 pytest 失败直接终止脚本, 后面的
-          # 摘要与注解都执行不到。这里临时关掉 -e 收下退出码。
+          # Actions 的 shell 带 -e, 叠加 pipefail 后 pytest 非零会直接退出,
+          # 下面的失败摘要与注解都执行不到, 故临时关掉 -e。
           set +e
           pytest tests/ -q --tb=short -rf --color=no 2>&1 | tee "$RUNNER_TEMP/pytest.log"
           rc=${PIPESTATUS[0]}
           set -e
           if [ "$rc" -ne 0 ]; then
+            python -c "import sys,torch,numpy;print('py=%s torch=%s numpy=%s gcc=%s'%(sys.version.split()[0],torch.__version__,numpy.__version__, __import__('shutil').which('gcc') or 'none'))" 2>&1 | sed 's/^/::error::env /' || true
             sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' "$RUNNER_TEMP/pytest.log" > "$RUNNER_TEMP/plain.log"
             {
               echo "### architecture-selfcheck (${{ matrix.os }}, ${{ matrix.python-version }})"
