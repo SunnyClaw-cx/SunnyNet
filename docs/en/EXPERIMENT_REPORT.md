@@ -2383,6 +2383,68 @@ project, so no ppl statement; here only "runs and is fast" is published, **no cl
 - INT4 requantization matrix direction: `gemv_i4` wants `(out, in)`, but the exporter writes `(in, out)`,
   so it must be transposed before quantization, otherwise reads go out of bounds and crash.
 
+### 24.11b External comparison: llama.cpp CPU backend (same weights)
+
+Every RWKV-7 speed number so far was "C kernel vs our own numpy" — not an external comparison. This section supplies the only
+credible form of it: **take one GGUF and compare against llama.cpp's CPU backend**.
+
+The weight source is `Mungert/rwkv7-191M-world-GGUF`'s `rwkv7-191M-world-bf16.gguf`; both sides start from it. llama.cpp reads the
+gguf directly (plus F32 / Q4_0 produced by `llama-quantize`); SunnyNet goes through the blob exported by `_export_rwkv7.py`
+(fp32 / INT4). llama.cpp is **b11889** (Clang 20.1.8 build, `llama-bench`, warmup built in, `-r 5` median); SunnyNet uses its own C
+kernel (single-step with state already built, median of 60 steps). Each cell is an independent subprocess; rounds are interleaved.
+
+This i7-8750H throttles under sustained load — adjacent rounds of the same config can differ by 2×. So **only the per-round paired
+ratio** is reported; absolute values are for reference. Script `experiments/_llamacpp_vs_sunny_st.py`.
+
+**（1）Single thread** (7 rounds, `THREADS=1`)
+
+| Impl | ms/token | Weight bytes | Effective BW |
+|---|---:|---:|---:|
+| llama.cpp bf16 | 35.7 | 384 MB | 10.75 GB/s |
+| llama.cpp F32 | 52.8 | 723 MB | 13.69 GB/s |
+| SunnyNet fp32 | 61.0 | 764 MB | 12.52 GB/s |
+| llama.cpp Q4_0 | 14.5 | 127 MB | 8.76 GB/s |
+| SunnyNet INT4 | 16.8 | 282 MB | 16.83 GB/s |
+
+| Per-round pair | Ratio | Rounds won |
+|---|---:|---:|
+| SunnyNet fp32 vs llama.cpp F32 (both fp32) | **0.90×** | 1/7 |
+| SunnyNet INT4 vs llama.cpp Q4_0 (both 4-bit) | **0.89×** | 0/7 |
+| SunnyNet INT4 vs llama.cpp bf16 (cross-precision) | 2.12× | 7/7 |
+
+**（2）Six threads** (5 rounds, `THREADS=6`)
+
+| Impl | ms/token | Effective BW |
+|---|---:|---:|
+| llama.cpp F32 | 37.1 | 19.49 GB/s |
+| SunnyNet fp32 | 61.0 | 12.52 GB/s |
+| llama.cpp Q4_0 | 9.1 | 13.93 GB/s |
+| SunnyNet INT4 | 13.1 | 21.51 GB/s |
+
+| Per-round pair | Ratio | Rounds won |
+|---|---:|---:|
+| SunnyNet fp32 vs llama.cpp F32 | **0.58×** | 0/5 |
+| SunnyNet INT4 vs llama.cpp Q4_0 | **0.71×** | 1/5 |
+
+**Conclusion (contrary to the existing narrative, recorded as measured)**: **on the same weights and precision, llama.cpp's CPU
+backend is faster than SunnyNet's C kernel** — about 1.1× single-thread, 1.4–1.7× at six threads. The earlier "5.39× over numpy"
+is an internal multiple and must not be presented as leading an external engine.
+
+Where the gap is:
+- **Single thread is already at the bandwidth wall.** SunnyNet fp32 reaches 12.5 vs llama.cpp 13.7 GB/s; both are near the sequential
+  read ceiling (18.63 GB/s measured on this machine), so the single-thread gap is only ~10%. It comes from llama.cpp's leaner
+  kernels: it uses SIMD vectorized loads and repack for F16/BF16 weights (`ggml-cpu-haswell` backend), while SunnyNet's GEMV uses a
+  scalar `cvtph_ps` expansion.
+- **The gap widens with threads.** llama.cpp reaches 19.5 GB/s at six threads, SunnyNet only 12.5 — the former partitions rows without
+  cross-thread redundant reads; SunnyNet's row-major parallelism does not saturate bandwidth.
+- **SunnyNet INT4's effective bandwidth reads high (16.8–21.5 GB/s)** because its 282 MB counts the fp32 embedding table, while the bulk
+  is INT4 matrices; dividing effective bytes by step time exceeds the sequential ceiling, meaning not all reads hit DRAM (some smaller
+  matrices stay in L2). This does not change the "~1.1–1.4× slower than llama.cpp Q4_0" conclusion.
+
+**Boundaries**: single machine, single model (191M), single sequence, B=1; the llama.cpp side has no KV cache (RWKV has none) and no
+prefill; llama.cpp uses the official prebuilt Haswell backend (F16C/AVX2 included, AVX-512 not enabled). The conclusion does not
+extrapolate to other architectures (Mamba-2 untested) or to other machines.
+
 ### 24.12 External weight integration: Mamba-2 and DeltaNet
 
 `runtime/mamba2.py`, `runtime/deltanet.py`. The same `step(token, state)` interface loads the official weights of two other

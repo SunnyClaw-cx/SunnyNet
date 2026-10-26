@@ -2,7 +2,7 @@
 
 *[English](../en/ROADMAP.md)*
 
-本文件记录 CPU 推理路线的四条边界、各项交付状态，并区分**本机实测**与**待真机复现**。
+本文件记录 CPU 推理路线的六条边界、各项交付状态，并区分**本机实测**与**待真机复现**。
 凡本机无验收环境的性能数字，一律标为待复现，不作为对外宣称。
 
 ## TL;DR
@@ -12,12 +12,12 @@
 | 死磕 CPU（AVX2/AVX-512/NEON），不做 CUDA | 守住 | 仓库无 CUDA 源码、无 `torch.cuda` |
 | 死磕线性架构，不碰标准 Transformer | 守住 | 无 `MultiheadAttention` 实现 |
 | 先做跑别人模型的引擎，再做自家模型 | 守住 | GGUF/外部权重通路先于自有权重发布 |
-| 不做 GUI / 训练框架 / 多模态 | 守住 | 无 tkinter/PyQt/gradio/streamlit 依赖 |
+| 不做 GUI / 训练框架 / 多模态 | 守住 | 无 tkinter/PyQt/gradio/streamlit 依赖；静态文字 Space 属演示非 GUI |
 | GGUF 兼容层、CLI、OpenAI server、量化、Ollama wrapper | 已本机验收 | 见 §2，验收 JSON 在 `experiments/roadmap_verify/` |
 | AVX-512 / NEON 内核 | 代码 + 语义等价已验，**性能待真机** | 见 §3 |
 | 树莓派 / Apple Silicon / RK3588 | **无验收环境** | 见 §4 |
 
-## 1. 四条边界
+## 1. 六条边界
 
 1. 只做 CPU：AVX2 / FMA 是已验证基线；AVX-512 与 NEON 提供源码与加载层，不做 CUDA 后端。
    理由：通用 GPU 推理栈（vLLM / TensorRT-LLM）是别人的主场。
@@ -29,6 +29,9 @@
    外部权重（RWKV-7 191M、Mamba-2 130M）。
 4. 不做 GUI、不做训练框架、不做多模态、不做聊天 UI/Oobabooga 插件。
    `serve.py` / `ollama.py` 只提供 HTTP 接口，不含前端。
+   与 HF Space 的关系：Space 定位为**演示入口**而非 GUI 产品——只放纯静态
+   HTML/JS（可复制的命令、录制的输出），不引 gradio/streamlit，不承载交互式
+   聊天界面，故不违反本条。底部自查命令的 grep 即用于守住这条线。
 5. 不维护自有权重格式：长期以 GGUF（或 safetensors + HF 标准）为权威格式，
    自有 `.runtime.bin` 只作本地缓存。
 6. 热路径不迁回 Python/PyTorch：护城河是无 PyTorch 的 C 内核。
@@ -63,6 +66,23 @@ INT4 / fp32 = 3.07×；INT4 / numpy = 18.81×。引擎构建（含 blob 导出�
 
 INT4 是 B=1 单序列路径，本机 12 逻辑核。与既有结论一致：倍数来自「权重字节数 ÷ 可用带宽」，
 不来自实现语言。
+
+**这两个倍数都是自家实现的内部对照**（C 对自家 numpy、INT4 对自家 fp32），不是外部引擎
+对照。与 llama.cpp 的同权重对照见 §2.1b——那才是对外的口径。
+
+### 2.1b 与 llama.cpp 的同权重对照
+
+同一份 `rwkv7-191M-world-bf16.gguf`，llama.cpp b11889 CPU 后端 vs SunnyNet C 内核。
+完整数据见 `EXPERIMENT_REPORT.md` §24.11b。本机滑动降频，倍数取逐轮配对的轮内比值。
+
+| 线程 | 同 fp32 | 同 4-bit | 结论 |
+|---:|---|---|---|
+| 1 | SunnyNet 0.90×（1/7） | SunnyNet 0.89×（0/7） | llama.cpp 略快 |
+| 6 | SunnyNet 0.58×（0/5） | SunnyNet 0.71×（1/5） | llama.cpp 明显快 |
+
+**同权重同精度下 llama.cpp 更快**，单线程约 1.1×、6 线程约 1.4–1.7×。此前"对 numpy 5.39×"
+是内部倍数，不作外部领先陈述。单线程两者都已贴顺序读上限（12.5 / 13.7 GB/s），差距主要在
+多线程带宽利用率（12.5 vs 19.5 GB/s）。
 
 ### 2.2 OpenAI 兼容 server
 

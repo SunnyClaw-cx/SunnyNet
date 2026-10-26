@@ -155,6 +155,15 @@ Foreign weights: `sunnynet/runtime/gguf.py` reads GGUF and `rwkv7.py` runs RWKV-
 
 **RWKV-7 C kernel** (`sunnynet/runtime/rwkv7.c`): the whole decode step — embedding lookup, per-layer norm and time-mix (LoRA, `tanh`/`sigmoid`), per-head matrix state recurrence with the rank-1 correction, group-norm, channel-mix, final norm, LM head — runs in C in one call per step. Per-token logits agree with the numpy reference to 7.25e-05 (bf16 precision), argmax 12/12, and 120/120 over a 120-step run. Speed: numpy 366.36 → C single-thread 67.92 ms/step (5.39×, C wins 5/5 rounds), 8 threads 48.88 (7.49×).
 
+Those multiples are **internal** (C against our own numpy), not an external comparison. So here is the same-weights comparison against llama.cpp's CPU backend (`experiments/_llamacpp_vs_sunny_st.py`, llama.cpp b11889):
+
+| Threads | vs llama.cpp, same fp32 | vs llama.cpp, same 4-bit |
+|---:|---|---|
+| 1 | **0.90×** (1/7 rounds) | **0.89×** (0/7) |
+| 6 | **0.58×** (0/5) | **0.71×** (1/5) |
+
+**On the same weights and precision llama.cpp is faster** — about 1.1× single-thread, 1.4–1.7× at six threads. Single-thread both sit near the sequential read ceiling (12.5 / 13.7 GB/s); the gap is mainly multithread bandwidth utilization (12.5 vs 19.5 GB/s). Full boundaries in [docs/en/EXPERIMENT_REPORT.md](https://github.com/SunnyClaw-cx/SunnyNet/blob/main/docs/en/EXPERIMENT_REPORT.md) §24.11b.
+
 **INT4 weight quantization** (`sunnynet/runtime/quant.c`): group-symmetric INT4, one fp32 scale per 64 consecutive weights, two values per byte. Quantized GEMV quantizes activations to INT8 on the same grouping and uses `maddubs` for the dot product. Blob size 729.1 → 269.0 MB, single-step decode 49.16 → 17.35 ms (2.83× end-to-end, 2.7× compression). The integer path is bit-identical to the explicit integer formula. Generation quality holds for English and degrades for Chinese and code — 4-bit needs calibration or mixed precision to preserve quality; only the "runs and is fast" result is claimed here. CLI: `--quant int4` with `--gguf-backend c`.
 
 **Mamba-2**: the same runtime interface loads official Mamba-2 weights and runs per-token single-step recurrence without a PyTorch forward.
@@ -251,6 +260,18 @@ sunnynet --ckpt sunnynet-small-zh/sunnynet-small-zh.pt \
 ```
 
 `hf` ships with `huggingface_hub`. The checkpoint is a 1.4M-parameter model (dim 128, 4 layers, vocab 8192) trained 16000 steps on the bundled Chinese corpus (val ppl 139.4); it emits classical Chinese. Add `--backend c --blob sunnynet-small-zh/sunnynet-small-zh.runtime.bin` to decode through the C runtime instead of torch.
+
+### Linux servers: use the Docker image
+
+The prebuilt wheel on PyPI only carries win-x86_64 `.so` files; on Linux the sdist needs a local gcc. The simplest path is the image (the build stage compiles the kernels with gcc, the runtime stage has no compiler):
+
+```bash
+docker run --rm -p 8080:8080 -v "$PWD/models:/models" \
+    ghcr.io/sunnyclaw-cx/sunnynet \
+    --ckpt /models/xxx.pt --tokenizer /models/tokenizer.json --host 0.0.0.0
+```
+
+Or build locally: `docker build -t sunnynet .` (Docker required). linux/amd64 only; the kernels target x86-64-v3. Separately, `manylinux` wheels are built by `.github/workflows/wheels.yml` via cibuildwheel, so installing those needs no compiler at all.
 
 To build the environment from scratch and train your own:
 

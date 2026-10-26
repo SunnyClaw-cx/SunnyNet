@@ -57,6 +57,21 @@ sunnynet --ckpt sunnynet-small-zh/sunnynet-small-zh.pt \
 `--backend c --blob sunnynet-small-zh/sunnynet-small-zh.runtime.bin`
 可改走 C 内核解码，不用 torch 前向。
 
+### Linux 服务器：用 Docker 镜像
+
+PyPI 上的预编译 wheel 只有 win-x86_64 的 `.so`，Linux 装 sdist 时要本机 gcc。
+最省事的是直接跑镜像（构建阶段装 gcc 编内核，运行层不带编译器）：
+
+```bash
+docker run --rm -p 8080:8080 -v "$PWD/models:/models" \
+    ghcr.io/sunnyclaw-cx/sunnynet \
+    --ckpt /models/xxx.pt --tokenizer /models/tokenizer.json --host 0.0.0.0
+```
+
+或本机构建：`docker build -t sunnynet .`（需要 Docker）。仅 linux/amd64，
+内核指令集为 x86-64-v3。附带说明：`manylinux` wheel 由
+`.github/workflows/wheels.yml` 用 cibuildwheel 产出，装它则不必有编译器。
+
 ### 环境
 
 - Python ≥ 3.10
@@ -559,6 +574,18 @@ IR 需要在元素级递推之外补一个矩阵值递推（外积 / rank-1 校�
 
 C 内核 8 线程对 1 线程再快 1.39×（5/5 逐轮占优）。单线程方差偏大（50–84 ms），
 绝对值随机器负载浮动，比值与逐轮符号检验一致。
+
+**上面这些是自家实现的内部倍数**（C 对自家 numpy），不是外部对照。与 llama.cpp 的同权重
+对照（`experiments/_llamacpp_vs_sunny_st.py`，llama.cpp b11889 CPU 后端）：
+
+| 线程 | 与 llama.cpp 同 fp32 | 与 llama.cpp 同 4-bit |
+|---:|---|---|
+| 1 | **0.90×**（1/7 逐轮占优） | **0.89×**（0/7） |
+| 6 | **0.58×**（0/5） | **0.71×**（1/5） |
+
+**同权重同精度下 llama.cpp 更快**：单线程约 1.1×、6 线程约 1.4–1.7×。单线程两者都已贴顺序
+读上限（12.5 / 13.7 GB/s），差距主要在多线程带宽利用率（12.5 vs 19.5 GB/s）。完整边界见
+[docs/cn/EXPERIMENT_REPORT.md](https://github.com/SunnyClaw-cx/SunnyNet/blob/main/docs/cn/EXPERIMENT_REPORT.md) §24.11b。
 
 CLI：`--gguf-backend c` 走 C 内核（需先运行 `_export_rwkv7.py` 导出 blob）：
 

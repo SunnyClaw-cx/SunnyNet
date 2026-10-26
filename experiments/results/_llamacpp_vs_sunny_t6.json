@@ -1,0 +1,73 @@
+{
+  "impl": "llama.cpp b11889 CPU vs SunnyNet rwkv7.c, 6 线程",
+  "weights": "同一份 BlinkDL/rwkv-7-world 191M",
+  "note": "本机滑动降频, 只看逐轮配对比值; 权重 MB 为该侧实际读取字节",
+  "threads": 6,
+  "rounds": 5,
+  "median_ms_tok": {
+    "llama.cpp F32": 37.09,
+    "SunnyNet fp32": 61.03,
+    "llama.cpp Q4_0": 9.12,
+    "SunnyNet INT4": 13.11
+  },
+  "effective_bandwidth_GBps": {
+    "llama.cpp F32": 19.49,
+    "SunnyNet fp32": 12.52,
+    "llama.cpp Q4_0": 13.93,
+    "SunnyNet INT4": 21.51
+  },
+  "paired_ratio": {
+    "SunnyNet fp32 vs llama.cpp F32": {
+      "ratios": [
+        0.697,
+        0.459,
+        0.734,
+        0.579,
+        0.433
+      ],
+      "median": 0.579,
+      "sunny_faster": "0/5"
+    },
+    "SunnyNet INT4 vs llama.cpp Q4_0": {
+      "ratios": [
+        0.576,
+        0.694,
+        0.771,
+        0.713,
+        1.126
+      ],
+      "median": 0.713,
+      "sunny_faster": "1/5"
+    }
+  },
+  "all_ms": {
+    "llama.cpp F32": [
+      41.9190778125,
+      37.0869925,
+      40.25709625,
+      35.3543615625,
+      36.9239565625
+    ],
+    "SunnyNet fp32": [
+      60.119900037534535,
+      80.78979991842061,
+      54.88169996533543,
+      61.033800011500716,
+      85.31769993714988
+    ],
+    "llama.cpp Q4_0": [
+      8.159159375,
+      9.10394375,
+      9.370600625,
+      9.1150890625,
+      16.4637840625
+    ],
+    "SunnyNet INT4": [
+      14.175700023770332,
+      13.111800071783364,
+      12.15800002682954,
+      12.790200067684054,
+      14.6171998931095
+    ]
+  }
+}

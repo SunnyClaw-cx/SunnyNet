@@ -1,0 +1,62 @@
+name: wheels
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build_wheels:
+    name: manylinux wheels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # setup.py 产出的轮子是 py3-none-<plat> (无 ABI 依赖), 单个轮子覆盖
+      # requires-python >=3.9 的全部解释器, 故只跑一个 cp312。
+      - name: Build manylinux wheels
+        uses: pypa/cibuildwheel@v4.3.4
+        env:
+          CIBW_BUILD: "cp312-manylinux_x86_64"
+          CIBW_ARCHS_LINUX: x86_64
+          # gcc 12 起才认 -march=x86-64-v3 (内核的编译标志); glibc 2.28 基线
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          # manylinux_2_28 是 AlmaLinux 8: 用 dnf/yum 装工具链
+          CIBW_BEFORE_BUILD: "dnf install -y gcc gcc-c++ || yum install -y gcc gcc-c++"
+          CIBW_TEST_COMMAND: "python -c \"from sunnynet import _native as n; import importlib; miss=[d for d in (importlib.import_module(x).DLL.name for x in n.MODULES) if n.find(d) is None]; print('prebuilt missing:', miss); assert not miss\""
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels
+          path: ./wheelhouse/*.whl
+
+  publish:
+    needs: build_wheels
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    env:
+      HAS_TOKEN: ${{ secrets.PYPI_API_TOKEN != '' }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels
+          path: dist/
+      - name: List wheels
+        run: ls -la dist/
+      - name: Publish with API token
+        if: env.HAS_TOKEN == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+          password: ${{ secrets.PYPI_API_TOKEN }}
+      - name: Publish via trusted publisher
+        if: env.HAS_TOKEN != 'true'
+        continue-on-error: true
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true

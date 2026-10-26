@@ -1,7 +1,7 @@
 *[中文版](../cn/ROADMAP.md)*
 # Roadmap and verification record
 
-This file records the four boundaries of the CPU inference roadmap, the state of each deliverable,
+This file records the six boundaries of the CPU inference roadmap, the state of each deliverable,
 and draws a hard line between **measured on this machine** and **waiting for the target hardware**.
 Numbers that have no verification environment here are marked as pending and are not claimed publicly.
 
@@ -12,7 +12,7 @@ Numbers that have no verification environment here are marked as pending and are
 | CPU only (AVX2/AVX-512/NEON), no CUDA | Held | no CUDA source, no `torch.cuda` |
 | Linear architectures only, no standard Transformer | Held | no `MultiheadAttention` |
 | Foreign models first, own model later | Held | GGUF / external-weight path precedes weight release |
-| No GUI / training framework / multimodal | Held | no tkinter/PyQt/gradio/streamlit dependency |
+| No GUI / training framework / multimodal | Held | no tkinter/PyQt/gradio/streamlit dependency; a static-text Space is a demo, not a GUI |
 | GGUF layer, CLI, OpenAI server, quantization, Ollama wrapper | Verified locally | §2, JSON in `experiments/roadmap_verify/` |
 | AVX-512 / NEON kernels | Code + semantic equivalence verified, **speed pending** | §3 |
 | Raspberry Pi / Apple Silicon / RK3588 | **No verification environment** | §4 |
@@ -30,6 +30,9 @@ Numbers that have no verification environment here are marked as pending and are
    foreign weights (RWKV-7 191M, Mamba-2 130M).
 4. No GUI, no training framework, no multimodal, no chat UI or Oobabooga plugin.
    `serve.py` / `ollama.py` expose HTTP only.
+   Relationship to an HF Space: a Space is a **demo entry point**, not a GUI product — static
+   HTML/JS only (copyable commands, recorded output), no gradio/streamlit, no interactive chat UI,
+   so it does not violate this rule. The self-check grep below guards that line.
 5. No bespoke weight format: GGUF (or safetensors + HF standard) is the authoritative format long
    term; the internal `.runtime.bin` is a local cache only.
 6. Keep the hot path out of Python/PyTorch: the moat is a C kernel with no PyTorch.
@@ -65,6 +68,23 @@ INT4 / fp32 = 3.07×; INT4 / numpy = 18.81×. Engine build including blob export
 
 INT4 is the B=1 single-sequence path on this 12-logical-core box. This matches the earlier finding:
 the multiple tracks weight bytes over available bandwidth, not the implementation language.
+
+**Both multiples are internal comparisons** (C against our own numpy, INT4 against our own fp32), not against an external engine.
+The same-weights comparison against llama.cpp is in §2.1b — that is the external statement.
+
+### 2.1b Same-weights comparison against llama.cpp
+
+One `rwkv7-191M-world-bf16.gguf`, llama.cpp b11889 CPU backend vs the SunnyNet C kernel. Full data in
+`EXPERIMENT_REPORT.md` §24.11b. This box throttles, so ratios are per-round paired.
+
+| Threads | Same fp32 | Same 4-bit | Verdict |
+|---:|---|---|---|
+| 1 | SunnyNet 0.90× (1/7) | SunnyNet 0.89× (0/7) | llama.cpp slightly faster |
+| 6 | SunnyNet 0.58× (0/5) | SunnyNet 0.71× (1/5) | llama.cpp clearly faster |
+
+**On the same weights and precision llama.cpp is faster**, about 1.1× single-thread and 1.4–1.7× at six threads. The earlier
+"5.39× over numpy" is an internal multiple and is not a claim of leading an external engine. Single-thread both sit near the
+sequential read ceiling (12.5 / 13.7 GB/s); the difference is mainly multithread bandwidth utilization (12.5 vs 19.5 GB/s).
 
 ### 2.2 OpenAI-compatible server
 

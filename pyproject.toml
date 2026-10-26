@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sunnynet-cx"
 dynamic = ["version"]
-description = "Original CPU-first sequence architecture with a standalone linear-recurrence inference runtime"
+description = "CPU-first linear-recurrence inference runtime: AVX2/AVX-512 C kernels, GGUF read, RWKV-7 / Mamba-2 weights, OpenAI-compatible server"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "Apache-2.0"

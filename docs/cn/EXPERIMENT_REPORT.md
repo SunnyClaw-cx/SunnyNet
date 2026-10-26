@@ -2638,6 +2638,69 @@ C 内核 8 线程对 1 线程再快 1.39×（5/5）。**边界**：单线程单�
 - INT4 重量化矩阵方向：`gemv_i4` 要 `(out, in)`，而导出器写入的是 `(in, out)`，
   须在量化前转置，否则读取越界崩溃。
 
+### 24.11b 外部对照：llama.cpp CPU 后端（同权重）
+
+此前所有 RWKV-7 速度数字都是"C 内核 vs 自家 numpy"，不是外部对照。本节补上唯一有
+公信力的口径：**拿同一份 GGUF，与 llama.cpp 的 CPU 后端比**。
+
+同一权重源 `Mungert/rwkv7-191M-world-GGUF` 的 `rwkv7-191M-world-bf16.gguf`，两侧从它出发：
+llama.cpp 直接读 gguf（另有 `llama-quantize` 转出的 F32 / Q4_0），SunnyNet 走
+`_export_rwkv7.py` 导出的 blob（fp32 / INT4）。llama.cpp 用 **b11889**（Clang 20.1.8 构建，
+`llama-bench`，进程内自带 warmup，`-r 5` 取中位）；SunnyNet 用自身 C 内核
+（已建状态后单步，60 步取中位）。每格独立子进程，多轮之间逐轮交错。
+
+本机 i7-8750H 在持续负载下滑动降频，同配置相邻两轮能差一倍。故**倍数只看逐轮配对的
+轮内比值**，绝对值仅作参考。脚本 `experiments/_llamacpp_vs_sunny_st.py`。
+
+**（1）单线程**（7 轮，`THREADS=1`）
+
+| 实现 | ms/token | 权重读取 | 有效带宽 |
+|---|---:|---:|---:|
+| llama.cpp bf16 | 35.7 | 384 MB | 10.75 GB/s |
+| llama.cpp F32 | 52.8 | 723 MB | 13.69 GB/s |
+| SunnyNet fp32 | 61.0 | 764 MB | 12.52 GB/s |
+| llama.cpp Q4_0 | 14.5 | 127 MB | 8.76 GB/s |
+| SunnyNet INT4 | 16.8 | 282 MB | 16.83 GB/s |
+
+| 逐轮配对 | 倍数 | 逐轮占优 |
+|---|---:|---:|
+| SunnyNet fp32 vs llama.cpp F32（同 fp32） | **0.90×** | 1/7 |
+| SunnyNet INT4 vs llama.cpp Q4_0（同 4-bit） | **0.89×** | 0/7 |
+| SunnyNet INT4 vs llama.cpp bf16（跨精度） | 2.12× | 7/7 |
+
+**（2）6 线程**（5 轮，`THREADS=6`）
+
+| 实现 | ms/token | 有效带宽 |
+|---|---:|---:|
+| llama.cpp F32 | 37.1 | 19.49 GB/s |
+| SunnyNet fp32 | 61.0 | 12.52 GB/s |
+| llama.cpp Q4_0 | 9.1 | 13.93 GB/s |
+| SunnyNet INT4 | 13.1 | 21.51 GB/s |
+
+| 逐轮配对 | 倍数 | 逐轮占优 |
+|---|---:|---:|
+| SunnyNet fp32 vs llama.cpp F32 | **0.58×** | 0/5 |
+| SunnyNet INT4 vs llama.cpp Q4_0 | **0.71×** | 1/5 |
+
+**结论（与既有叙事相反，如实记录）**：**同权重同精度下，llama.cpp 的 CPU 后端比
+SunnyNet 的 C 内核快**——单线程约 1.1×、6 线程约 1.4–1.7×。此前"5.39× 对 numpy"
+是自家实现的内部倍数，不能拿来对外宣称领先外部引擎。
+
+差距的定位：
+- **单线程已贴带宽墙。** SunnyNet fp32 达 12.5 / llama.cpp 13.7 GB/s，两者都在顺序读
+  上限（本机实测 18.63 GB/s 单线程）附近，故单线程差距只有 ~10%。差距来自 llama.cpp
+  的 kernel 更省指令：它对 F16/BF16 权重做了 SIMD 向量化取指与 repack（`ggml-cpu-haswell`
+  后端），SunnyNet 的 GEMV 是标量 `cvtph_ps` 展开。
+- **多线程差距扩大。** llama.cpp 6 线程带宽 19.5 GB/s，SunnyNet 只有 12.5 —— 前者按
+  行块切分且线程间无重复读，SunnyNet 的行主序并行没有把带宽吃满。
+- **SunnyNet INT4 的带宽数值反高（16.8–21.5 GB/s）**，是因为 282 MB 是含 fp32 嵌入表的
+  实际字节，而量大头在 INT4 矩阵；按"有效字节 ÷ 步时"折算已超过顺序读上限，说明它读的
+  不全是 DRAM（部分命中小矩阵的 L2）。这不改变"比 llama.cpp Q4_0 慢约 1.1–1.4×"的结论。
+
+**边界**：单机、单模型（191M）、单序列、B=1；llama.cpp 侧不含 KV cache（RWKV 无 KV），
+不含 prefill；llama.cpp 用官方预编译 Haswell 后端（含 F16C/AVX2，未启用 AVX-512）。
+结论不外推到其他架构（Mamba-2 未测），也不声称在其他机器上倍数不变。
+
 ### 24.12 外部权重接入：Mamba-2 与 DeltaNet
 
 `runtime/mamba2.py`、`runtime/deltanet.py`。同一 `step(token, state)` 接口加载另外两种
