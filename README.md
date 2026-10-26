@@ -591,9 +591,9 @@ INT4 端到端 **2.83×**（5/5 逐轮占优），体积 2.7× 压缩。整数�
 
 CLI：`--quant int4`（配合 `--gguf-backend c`）。
 
-### 外部权重：Mamba-2 与 DeltaNet（`sunnynet/runtime/mamba2.py`、`deltanet.py`）
+### 外部权重：Mamba-2（`sunnynet/runtime/mamba2.py`）
 
-同一套 Runtime 接口加载另外两种线性架构的官方权重，逐 token 单步递推，不经 PyTorch 前向。
+Runtime 接口加载 Mamba-2 官方权重，逐 token 单步递推，不经 PyTorch 前向。
 
 **Mamba-2**（`state-spaces/mamba2-130m`，d_model 768 / 24 层 / 24 head × 64）：
 
@@ -615,62 +615,12 @@ S_t = S_{t-1} ⊙ dA + (dt_h · B_g) ⊗ x_h  # 无需矩阵-向量乘积
   ⇒ 差异是单精度累积，非公式错误。
 - 分段续算 vs 全程 **逐位 0.0**；贪心续写英文与代码连贯。
 
-**DeltaNet**（`fla-org` 的 DeltaNet 340M，hidden 1024 / 24 层 / 8 head × 128，短卷积 4）：
+**速度（单线程 numpy 参考路径，每格独立子进程 × 5 轮）**：median **45.68** ms/token
+（min 38.27 / max 55.42）。这是参考路径的绝对耗时，**不与任何基线比倍数**；
+单步安全上界 `O(heads × head_dim × state_size)`，与上下文长度无关。
 
-```bash
-python -m sunnynet.cli --hf-dir <模型目录> --hf-arch deltanet \
-    --prompt "The capital of France is" --stats
-```
-
-真 delta rule，状态 `(k_dim=128, v_dim=128)`，更新含 rank-1 校正：
-
-```
-δ_t = (v_t − S_{t-1}ᵀ k_t) · β_t
-S_t = S_{t-1} + k_t ⊗ δ_t
-o_t = S_tᵀ q_t
-```
-
-- 秩 1 形式与显式 `(I − β k kᵀ) S + β k vᵀ` 写法的独立实现 **max|diff| 4.6e-05**
-  （fp32 累积量级）。注意 `head_k_dim == head_v_dim` 时把 `S` 乘错一侧不会报维度错，
-  只会静默算成另一个式子，故两种写法必须分开验证。
-- 分段续算 vs 全程 **逐位 0.0**；贪心输出
-  `"<s>The capital of France is the city of Paris. It is the largest city in Europe…"`。
-
-**速度（单线程 numpy 参考路径，每格独立子进程 × 5 轮）**：
-
-| 架构 | median ms/token | min | max | 状态 |
-|---|---|---|---|---|
-| mamba2 | 45.68 | 38.27 | 55.42 | 元素级递推，**可搬进 C 内核复用 `recur.c`** |
-| deltanet | 91.46 | 83.93 | 99.19 | 矩阵值 rank-1 递推，**现有内核无法表达** |
-
-这是参考路径的绝对耗时，**不与任何基线比倍数**。两者的单步安全上界都是
-`O(heads × head_dim × state_size)`，与上下文长度无关。
-
-**矩阵值递推是唯一尚未进 C 的层级**：RWKV-7 与 DeltaNet 的状态更新都含
-`S ← S + k ⊗ (·)` 这类外积累加，`SN_FMA`/`SN_GATED` 的逐通道形式表达不了，
-需要新增一个 rank-1 递推内核；Mamba-2 与 GLA 因衰减外积可分解，不需要。
-
-**GLA**（`fla-hub/gla-340M-15B`，hidden 1024 / 24 层 / 4 head × 128，gate_rank 16）：
-
-```bash
-python -m sunnynet.cli --hf-dir <模型目录> --hf-arch gla \
-    --prompt "The capital of France is" --max-new 24 --stats
-```
-
-GLA 的门控 `gk = logsigmoid(·) / 16` 只作用在 key 维，衰减可分解为按行缩放，
-状态递推退化为元素级，与 Mamba-2 同类：
-
-```
-S_t = diag(exp(gk_t)) · S_{t-1} + k_t ⊗ v_t
-o_t = scale · S_tᵀ q_t,  scale = head_k_dim^{-1/2}
-```
-
-读出后接 `RMSNorm(o) · silu(g)`（先归一后乘门，`norm_before_gate=False`）。
-
-- 与独立参考实现 max|diff| **2.05e-05**，argmax **12/12**；分段续算 **逐位 0.0**。
-- 贪心续写 `"The capital of France is the city of Paris."`；`--stats` 下格确认。
-- 衰减可分解性由测试直接断言（`test_gla_decay_is_elementwise_decomposable`），
-  防止后续误当成矩阵值递推。
+衰减外积可分解 ⇒ 复用 `recur.c` 已有的元素级递推，无需新增内核层级。
+矩阵值 rank-1 层级（`S ← S + k ⊗ (·)`）由 RWKV-7 使用，走 `sn_mat_scan`。
 
 ### OpenAI 兼容 HTTP 服务（`sunnynet/serve.py`）
 
@@ -680,7 +630,7 @@ o_t = scale · S_tᵀ q_t,  scale = head_k_dim^{-1/2}
 ```bash
 sunnynet-serve --ckpt <checkpoint.pt> --host 127.0.0.1 --port 8080
 sunnynet-serve --gguf <model.gguf> --gguf-backend c --port 8080   # RWKV-7
-sunnynet-serve --hf-dir <模型目录> --hf-arch gla --port 8080        # GLA
+sunnynet-serve --hf-dir <模型目录> --hf-arch mamba2 --port 8080      # Mamba-2
 ```
 
 | 端点 | 说明 |
@@ -848,13 +798,9 @@ python -m sunnynet.cli --ckpt experiments/ckpts_ood/sunnynet.pt \
 python -m sunnynet.cli --gguf experiments/gguf/rwkv7-191M-world-bf16.gguf \
     --prompt "The Eiffel Tower is located in the city of" --max-new 40
 
-# 外部 HF 权重 (Mamba-2 / DeltaNet / GLA)
+# 外部 HF 权重 (Mamba-2)
 python -m sunnynet.cli --hf-dir <模型目录> --hf-arch mamba2 \
     --tokenizer-dir <GPT-NeoX tokenizer 目录> --prompt "def fibonacci(n):" --stats
-python -m sunnynet.cli --hf-dir <模型目录> --hf-arch deltanet \
-    --prompt "The capital of France is" --max-new 20 --stats
-python -m sunnynet.cli --hf-dir <模型目录> --hf-arch gla \
-    --prompt "The capital of France is" --max-new 24 --stats
 
 # OpenAI 兼容服务
 sunnynet-serve --ckpt <checkpoint.pt> --port 8080
@@ -871,7 +817,7 @@ sunnynet-release <checkpoint.pt> --out-dir dist/release
 
 ```python
 from sunnynet.runtime import load_model
-m = load_model("deltanet", "<模型目录>")   # 或 "mamba2" / "rwkv7"
+m = load_model("mamba2", "<模型目录>")     # 或 "rwkv7"
 st = m.reset(m.init_state())
 logits = m.step(token, st)                 # 每步 O(1)
 ```
@@ -883,7 +829,7 @@ logits = m.step(token, st)                 # 每步 O(1)
 跨架构映射验证、**GGUF 只读 + RWKV-7 权重跑通（数值与官方 .pth 等价）**、
 **RWKV-7 整模型 C 内核（对 numpy 5.39×，8 线程 7.49×）**、
 **INT4 权重量化（端到端 2.83×，体积 2.7× 压缩）**、
-**Mamba-2 / DeltaNet / GLA 官方权重接入（数值对齐参考实现，贪心生成连贯）**、
+**Mamba-2 官方权重接入（数值对齐参考实现，贪心生成连贯）**、
 **AVX-512 与 NEON 内核源码（编译 + shim 执行等价验证）**、
 **GGUF 一行命令走 C 内核（`sunnynet chat -m xxx.gguf`，blob 自动导出缓存）**、
 **CLI 子命令（`chat` / `serve` / `convert` / `quantize` / `info`）**、
@@ -895,8 +841,8 @@ logits = m.step(token, st)                 # 每步 O(1)
 
 近期：权重发布（`sunnynet-release`）。
 
-中期：补矩阵值递推（外积 / rank-1 校正）内核，把 RWKV-7 与 DeltaNet 的单步也搬进 C
-（Mamba-2 与 GLA 已可复用现有递推）。
+中期：补矩阵值递推（外积 / rank-1 校正）内核，把 RWKV-7 的单步也搬进 C
+（Mamba-2 已可复用现有递推）。
 
 不做的：复刻 llama.cpp 的通用张量算子层（GGML 为 Transformer 设计，逐算子调度）；
 打平 Transformers / vLLM（分别为模型仓库与 GPU 服务赛道）。
@@ -920,7 +866,7 @@ sunnynet/
   model.py        SunnyNet 主体 (状态 (B,L,D), 逐层接力)
   init.py         谱锚定初始化
   cli.py          命令行推理 (加载 ckpt -> 分词器 -> 自回归解码, --backend torch/c;
-                  --gguf 走外部 RWKV-7 权重; --hf-dir 走 Mamba-2 / DeltaNet / GLA)
+                  --gguf 走外部 RWKV-7 权重; --hf-dir 走 Mamba-2)
   serve.py        OpenAI 兼容 HTTP 服务 (标准库实现, --host / --port)
   integrate.py    Ollama / LM Studio 接入 (Modelfile 生成 + 探活 + GGUF 放置)
   release.py      权重发布导出 (safetensors + runtime blob + 模型卡 + sha256)
@@ -934,8 +880,7 @@ sunnynet/
     rwkv7.py        RWKV-7 单步递推 (numpy 参考路径, 读 GGUF 权重)
     rwkv7_c.py      RWKV-7 整模型 C 内核绑定
     mamba2.py       Mamba-2 单步递推 (衰减外积可分解, 元素级)
-    deltanet.py     DeltaNet 单步递推 (真 rank-1 校正, 矩阵值)
-    gla.py          GLA 单步递推 (门控只在 key 维, 元素级)
+    mamba2_c.py     Mamba-2 整模型 C 内核绑定
   baseline.py     同参数量 Transformer 对照 (仅用于对照, 非架构本体)
   tokenizer.py    从零实现的 BPE 分词器
   profiling.py    真实性能探针 (峰值内存 / 访存 / 吞吐)
@@ -952,7 +897,7 @@ experiments/
 tests/
   test_architecture.py  架构自检 (分块一致性 / 因果性 / 梯度界 / 深度稳定, 63 项)
   test_runtime_model.py C 整模型解码一致性
-  test_runtime_hf.py    Mamba-2 / DeltaNet / GLA 外部权重接入
+  test_runtime_hf.py    Mamba-2 外部权重接入
   test_rwkv7_gguf.py    GGUF 加载 / 张量对齐 / RWKV-7 递推等价 / 分词往返
   test_abi.py           C API 稳定 ABI 契约 (版本 / 能力位 / 错误码 / 步进等价)
   test_simd.py          AVX-512 编译产物 + NEON 交叉编译与反汇编

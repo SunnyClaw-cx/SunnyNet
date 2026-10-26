@@ -65,8 +65,7 @@ def mark_gguf(src: str | Path, dst: str | Path,
 
     w.add_string(_MARK + "arch", arch)
     w.add_uint32(_MARK + "version", 1)
-    w.add_bool(_MARK + "kernel_c", arch in ("rwkv7", "mamba2", "deltanet",
-                                            "gla", "hgrn2"))
+    w.add_bool(_MARK + "kernel_c", arch in ("rwkv7", "mamba2"))
     w.add_string(_MARK + "source_sha256", _sha256(src))
     if blob is not None and Path(blob).exists():
         w.add_string(_MARK + "blob_sha256", _sha256(blob))

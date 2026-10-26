@@ -245,7 +245,7 @@ def write_lmstudio_config(out_path: str | Path,
         },
         "path_b_endpoint": {
             "desc": "把 SunnyNet 的 OpenAI 兼容服务配为自定义 endpoint",
-            "server_start_command": "sunnynet-serve --hf-dir <模型目录> --hf-arch gla --port 8080",
+            "server_start_command": "sunnynet-serve --hf-dir <模型目录> --hf-arch mamba2 --port 8080",
             "base_url": base_url,
             "api_key": api_key,
             "model_id": model_id,

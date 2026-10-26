@@ -25,14 +25,11 @@ REPO = Path(__file__).resolve().parents[1]
 DEFAULT_TOKENIZER = REPO / "data" / "proc" / "tokenizer.json"
 
 # --hf-arch 的合法取值, CLI / serve / ollama 三处共用, 免得再漂移
-HF_ARCHES = ("mamba2", "deltanet", "gla", "hgrn2")
+HF_ARCHES = ("mamba2",)
 
 # 架构 -> (绑定模块, 句柄类); 整模型前向全在 C
 _HF_C = {
-    "deltanet": ("runtime.deltanet_c", "SnDeltaNet"),
     "mamba2": ("runtime.mamba2_c", "SnMamba2"),
-    "gla": ("runtime.gla_c", "SnGLA"),
-    "hgrn2": ("runtime.hgrn2_c", "SnHGRN2"),
 }
 
 __all__ = ["build_engine", "Engine", "HFEngine", "HFCEngine", "HF_ARCHES",
@@ -152,18 +149,12 @@ def _hf_eos(model_dir: str | Path, tokenizer_dir: str | None = None):
 
 
 class HFEngine(Engine):
-    """Mamba-2 / DeltaNet / GLA / HGRN2: HF safetensors 权重, numpy 单步."""
+    """Mamba-2: HF safetensors 权重, numpy 单步."""
 
     def __init__(self, arch: str, model_dir: str, tokenizer_dir: str | None = None):
         self.name = arch
         if arch == "mamba2":
             from .runtime.mamba2 import Mamba2 as Model
-        elif arch == "deltanet":
-            from .runtime.deltanet import DeltaNet as Model
-        elif arch == "gla":
-            from .runtime.gla import GLA as Model
-        elif arch == "hgrn2":
-            from .runtime.hgrn2 import HGRN2 as Model
         else:
             raise ValueError(f"未支持的 --hf-arch: {arch}")
         self.model = Model(model_dir)
@@ -613,7 +604,7 @@ def main(argv=None):
     ap.add_argument("--quant", choices=["fp32", "int4"], default="fp32")
     ap.add_argument("--blob", default=None)
     ap.add_argument("--hf-dir", default=None)
-    ap.add_argument("--hf-arch", choices=list(HF_ARCHES), default="gla")
+    ap.add_argument("--hf-arch", choices=list(HF_ARCHES), default="mamba2")
     ap.add_argument("--tokenizer-dir", default=None)
     ap.add_argument("--tokenizer", default=str(DEFAULT_TOKENIZER))
     ap.add_argument("--threads", type=int, default=0, help="0 = 不限制")

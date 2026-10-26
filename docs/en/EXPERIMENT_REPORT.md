@@ -1934,6 +1934,12 @@ python -X utf8 experiments/_decode_seven.py 256,512,1024,2048,4096 2  # §23.3 d
 
 A C inference kernel independent of PyTorch, directory `sunnynet/runtime/`, depending only on ctypes and a C compiler.
 
+> Scope note: the Mamba-2 / DeltaNet / GLA / HGRN2 measurements from §24.12 onward are a
+> historical record. As of 2026-10-26 the supported architecture list is RWKV-7 and Mamba-2
+> only; the code and CLI dispatch for GLA / DeltaNet / HGRN2 have been removed (all three
+> carry weights ≥1.37 GB and their C speedup is already at the bandwidth ceiling). The data
+> here is retained as the rationale for that decision and as reproducible evidence.
+
 ### 24.1 Unified recurrence form
 
 ```

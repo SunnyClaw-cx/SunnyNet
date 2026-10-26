@@ -157,13 +157,11 @@ Foreign weights: `sunnynet/runtime/gguf.py` reads GGUF and `rwkv7.py` runs RWKV-
 
 **INT4 weight quantization** (`sunnynet/runtime/quant.c`): group-symmetric INT4, one fp32 scale per 64 consecutive weights, two values per byte. Quantized GEMV quantizes activations to INT8 on the same grouping and uses `maddubs` for the dot product. Blob size 729.1 → 269.0 MB, single-step decode 49.16 → 17.35 ms (2.83× end-to-end, 2.7× compression). The integer path is bit-identical to the explicit integer formula. Generation quality holds for English and degrades for Chinese and code — 4-bit needs calibration or mixed precision to preserve quality; only the "runs and is fast" result is claimed here. CLI: `--quant int4` with `--gguf-backend c`.
 
-**Mamba-2, DeltaNet, GLA**: the same runtime interface loads official weights for three more linear architectures and runs per-token single-step recurrence without a PyTorch forward.
+**Mamba-2**: the same runtime interface loads official Mamba-2 weights and runs per-token single-step recurrence without a PyTorch forward.
 
 - Mamba-2 (`state-spaces/mamba2-130m`): each head state is a `(64, 128)` matrix, but the decay `dA = exp(dt·A)` is identical over the state dim and the outer product factorizes, so it reduces to an elementwise first-order recurrence. Against `Mamba2ForCausalLM` the whole forward agrees to 5.9e-04 (argmax 24/24); official fp32 itself deviates 3.8e-04 from fp64 while this implementation deviates 2.5e-04, so the difference is single-precision accumulation, not a formula error. Segmented continuation is bit-identical to the full run.
-- DeltaNet (340M, hidden 1024 / 24 layers / 8 head × 128): a true delta rule with a rank-1 correction. The rank-1 form and the explicit `(I − β k kᵀ) S + β k vᵀ` form agree to 4.6e-05. Note that when `head_k_dim == head_v_dim`, multiplying `S` on the wrong side raises no dimension error and silently computes another expression, so both forms must be validated separately.
-- GLA (`fla-hub/gla-340M-15B`): the gate `gk = logsigmoid(·) / 16` acts on the key dimension only, the decay factorizes into a per-row scale, and the recurrence is elementwise. Agreement with an independent reference 2.05e-05, argmax 12/12; decay decomposability is asserted directly by a test so it cannot later be mistaken for a matrix-valued recurrence.
 
-All three run their whole forward pass in C via `--hf-arch {mamba2|deltanet|gla} --blob`: per-token logits DeltaNet 1.335e-05, Mamba-2 1.678e-04, GLA 1.431e-05, argmax 36/36 each. Speedups 1.10× / 1.37× / 1.01× — the gain tracks weight bytes over available bandwidth, and a 1.37 GB weight is already at the single-thread sequential-read ceiling (18.63 GB/s). Matrix-valued rank-1 recurrence is the one layer not yet fully in C; a dedicated kernel (`sn_mat_scan`) covers the RWKV-7 and DeltaNet state forms.
+The whole forward pass runs in C via `--hf-arch mamba2 --blob`: per-token logits 1.678e-04, argmax 36/36. Speedup 1.37×, the only one not yet at the bandwidth ceiling — the gain tracks weight bytes over available bandwidth, and the 0.52 GB weight is small enough to leave headroom (a 1.37 GB weight is already at the single-thread sequential-read ceiling of 18.63 GB/s). Matrix-valued rank-1 recurrence (`S ← S + k ⊗ (·)`) is used by RWKV-7 and covered by a dedicated kernel (`sn_mat_scan`); Mamba-2 factorizes and reuses the elementwise recurrence.
 
 **fp16 decode path**: truncating the five GEMV matrices and the LM head to fp16 at load time (small parameters stay fp32) drops bytes read per step from 467.6 to ~222.3 MB. Median 24.67 → 18.60 ms/token (1.33×, fp16 wins 11/11 rounds), logits max|diff| 4.181e-03 (relative 7.42e-04), argmax 64/64. The kernel reads 16 half values (32 B) at a time before converting, preserving load width. Use `--backend c --half`; fp32 remains the default and is bit-identical. fp16 is no longer bandwidth-bound (12.0 GB/s), so the bottleneck moves to type conversion.
 
@@ -214,7 +212,7 @@ CLI:
 python -m sunnynet.cli --ckpt runs/small.pt --prompt "..." --max-new 80 --stats
 python -m sunnynet.cli --ckpt runs/small.pt --backend c --half --prompt "..."   # pure-C decode, fp16
 python -m sunnynet.cli --gguf model.gguf --gguf-backend c --quant int4 --prompt "..."
-python -m sunnynet.cli --hf-dir <model dir> --hf-arch {mamba2|deltanet|gla} --prompt "..."
+python -m sunnynet.cli --hf-dir <model dir> --hf-arch mamba2 --prompt "..."
 sunnynet-serve --ckpt runs/small.pt --port 8080
 sunnynet-integrate ollama model.gguf --name sunnynet-rwkv7 --run --smoke
 sunnynet-release runs/small.pt --out-dir dist/release
@@ -224,12 +222,12 @@ The loading entry point is also callable from Python:
 
 ```python
 from sunnynet.runtime import load_model
-m = load_model("deltanet", "<model dir>")   # or "mamba2" / "rwkv7"
+m = load_model("mamba2", "<model dir>")     # or "rwkv7"
 st = m.reset(m.init_state())
 logits = m.step(token, st)                  # O(1) per step
 ```
 
-**Roadmap.** Existing assets: the original architecture, the AVX2 fused kernel (training step 1.10–1.17×), the generic recurrent C runtime (9.9× median against a vectorized baseline), whole-model C single-step decode (B=1 single thread 1.53–2.05×), cross-architecture mapping verification, GGUF read plus RWKV-7 weights (numerically equivalent to the official `.pth`), the RWKV-7 whole-model C kernel (5.39× over numpy, 7.49× at 8 threads), INT4 quantization (2.83× end-to-end), official Mamba-2 / DeltaNet / GLA weights (numerically aligned, coherent greedy generation), AVX-512 and NEON kernel source (compiled, plus shim-executed equivalence), one-command GGUF into the C kernel (`sunnynet chat -m x.gguf`, blob exported and cached automatically), the `chat` / `serve` / `convert` / `quantize` / `info` subcommands, GGUF quantization with perplexity, the OpenAI-compatible server, a native Ollama API server, Ollama / LM Studio integration, and the stable C ABI. Near term: weight release via `sunnynet-release`. Mid term: a matrix-valued rank-1 recurrence kernel to bring RWKV-7 and DeltaNet single-step into C (Mamba-2 and GLA can reuse the existing recurrence). Not planned: replicating llama.cpp's general tensor-operator layer, or matching Transformers / vLLM head-on. Verification protocols, items pending real hardware, and what was left out are in [docs/en/ROADMAP.md](https://github.com/SunnyClaw-cx/SunnyNet/blob/main/docs/en/ROADMAP.md).
+**Roadmap.** Existing assets: the original architecture, the AVX2 fused kernel (training step 1.10–1.17×), the generic recurrent C runtime (9.9× median against a vectorized baseline), whole-model C single-step decode (B=1 single thread 1.53–2.05×), cross-architecture mapping verification, GGUF read plus RWKV-7 weights (numerically equivalent to the official `.pth`), the RWKV-7 whole-model C kernel (5.39× over numpy, 7.49× at 8 threads), INT4 quantization (2.83× end-to-end), official Mamba-2 weights (numerically aligned, coherent greedy generation), AVX-512 and NEON kernel source (compiled, plus shim-executed equivalence), one-command GGUF into the C kernel (`sunnynet chat -m x.gguf`, blob exported and cached automatically), the `chat` / `serve` / `convert` / `quantize` / `info` subcommands, GGUF quantization with perplexity, the OpenAI-compatible server, a native Ollama API server, Ollama / LM Studio integration, and the stable C ABI. Near term: weight release via `sunnynet-release`. Mid term: a matrix-valued rank-1 recurrence kernel to bring RWKV-7 single-step into C (Mamba-2 can reuse the existing recurrence). Not planned: replicating llama.cpp's general tensor-operator layer, or matching Transformers / vLLM head-on. Verification protocols, items pending real hardware, and what was left out are in [docs/en/ROADMAP.md](https://github.com/SunnyClaw-cx/SunnyNet/blob/main/docs/en/ROADMAP.md).
 
 ### Originality
 
@@ -294,7 +292,7 @@ sunnynet/
   model.py         SunnyNet body (state (B,L,D), relayed layer by layer)
   init.py          spectral-anchored initialization
   cli.py           command-line inference (ckpt -> tokenizer -> autoregressive decode; --backend torch/c;
-                   --gguf for external RWKV-7 weights; --hf-dir for Mamba-2 / DeltaNet / GLA)
+                   --gguf for external RWKV-7 weights; --hf-dir for Mamba-2)
   serve.py         OpenAI-compatible HTTP server (standard library, --host / --port)
   integrate.py     Ollama / LM Studio integration (Modelfile generation + probe + GGUF placement)
   release.py       weight release export (safetensors + runtime blob + model card + sha256)
@@ -309,8 +307,7 @@ sunnynet/
     gguf.py         GGUF read-only loader (f16/bf16/f32 + quantized dequantization)
     rwkv7.py        RWKV-7 single-step recurrence (numpy reference path, reads GGUF weights)
     mamba2.py       Mamba-2 single-step recurrence
-    deltanet.py     DeltaNet single-step recurrence (true rank-1 correction, matrix-valued)
-    gla.py          GLA single-step recurrence (gate on the key dim only, elementwise)
+    mamba2_c.py     Mamba-2 whole-model C kernel binding
   baseline.py      same-parameter Transformer baseline (for comparison only, not part of the architecture)
   tokenizer.py     BPE tokenizer written from scratch
   profiling.py     real performance probes (peak memory / memory traffic / throughput)

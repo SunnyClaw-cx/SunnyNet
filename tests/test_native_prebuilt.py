@@ -33,7 +33,6 @@ def test_every_runtime_c_module_is_registered():
 
     漏登记不会让任何测试变红: build_prebuilt 只按 MODULES 遍历, 缺登记的库
     既不进 wheel 也不写清单, 装机后只能退回源码编译 (需自带 C 编译器)。
-    真实发生过 —— 新增 hgrn2_c 后 _prebuilt/ 里少了 sunnynet_hgrn2.dll。
     """
     rt = _native.HERE / "runtime"
     for p in sorted(rt.glob("*_c.py")):

@@ -31,14 +31,10 @@ def blob_path(gguf: str | Path, quant: str = "int4") -> Path:
     return p.with_suffix(".q4.bin" if quant == "int4" else ".runtime.bin")
 
 
-# general.architecture -> 本包已实现的架构名。只有 rwkv7 能由 GGUF 直出 C blob;
-# 其余四个走 HF 权重 + 预导出的 .c.bin, 见 HF_ARCHES。
+# general.architecture -> 本包已实现的架构名。
 GGUF_ARCHES = {
     "rwkv7": "rwkv7", "rwkv": "rwkv7",
     "mamba2": "mamba2", "mamba": "mamba2",
-    "deltanet": "deltanet", "delta_net": "deltanet",
-    "gla": "gla",
-    "hgrn2": "hgrn2",
 }
 
 
@@ -56,22 +52,14 @@ def require_rwkv7_gguf(gguf: str | Path) -> None:
         return
     hint = (f"该 GGUF 的架构是 {arch!r}, 但 GGUF 直出 C 内核 blob 目前只支持 RWKV-7。\n"
             f"其余架构请用 HF 权重目录:\n"
-            f"  sunnynet chat --hf-dir <权重目录> --hf-arch {arch} --blob <架构>.c.bin\n"
-            f"(--hf-arch 取值: mamba2 / deltanet / gla / hgrn2)")
+            f"  sunnynet chat --hf-dir <权重目录> --hf-arch mamba2 --blob <架构>.c.bin")
     raise SystemExit(hint)
 
 
 # 整模型 C 内核 blob 的头部协议, 由各架构的 .c 定义, 两处必须同步改
-# DeltaNet / Mamba-2: <8i + f 后是 3 个 int (vocab, conv, tied) -> vocab 在 int 索引 9
-# GLA / HGRN2:        <8i + 4f 后是 5 个 int                    -> vocab 在 int 索引 12
+# Mamba-2: <8i + f 后是 3 个 int (vocab, conv, tied) -> vocab 在 int 索引 9
 _HF_BLOB_LAYOUT = {
-    0x4E4E4444: ("<8if3i", 48, 9),   # DeltaNet fp32
-    0x51444E44: ("<8if3i", 48, 9),   # DeltaNet INT4
     0x324E4D53: ("<8if3i", 48, 9),   # Mamba-2
-    0x414C4753: ("<8i4f5i", 68, 12),  # GLA fp32
-    0x51414C47: ("<8i4f5i", 68, 12),  # GLA INT4
-    0x32474853: ("<8i4f5i", 68, 12),  # HGRN2 fp32
-    0x51474853: ("<8i4f5i", 68, 12),  # HGRN2 INT4
 }
 
 

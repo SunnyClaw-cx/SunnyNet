@@ -41,8 +41,7 @@ void sn_recur_step(const float* a, const float* b, float* s, int B, int N, int g
  * 参 NULL 即跳过该项: w=NULL 无衰减, u=NULL 跳过投影, b=NULL 无校正,
  * r=NULL 不计算 y。各架构映射:
  *     RWKV-7   w=衰减(列) u=kk  v=v k=k b=kk*a r=r
- *     DeltaNet w=NULL u=k v=beta*v k=k b=beta*k r=q (状态按 (V,K) 存)
- *     GLA/Mamba-2 衰减可分解, 走元素级 sn_recur_step 即可
+ *     Mamba-2  衰减可分解, 走元素级 sn_recur_step 即可
  *
  * S: (NH,R,C) 行主序原地更新; w/u/k/b/r: (NH,C); v/y: (NH,R);
  * pbuf: (NH,R) 暂存, 由调用方提供以免内核内分配。

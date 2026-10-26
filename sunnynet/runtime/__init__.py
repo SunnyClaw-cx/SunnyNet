@@ -7,8 +7,6 @@
 外部权重的单步递推走递推式而非分块扫描:
     rwkv7     逐 head 矩阵 + rank-1 校正, GGUF 权重
     mamba2    逐 head 矩阵但衰减外积可分解, 退化为 SN_FMA
-    deltanet  delta rule, 真 rank-1 校正, 需矩阵值递推
-    gla       只按 key 维衰减, 衰减可分解, 退化为元素级递推
 矩阵值递推 (rank-1) 不能由 SN_FMA 表达, 走 sn_mat_scan。
 """
 from __future__ import annotations
@@ -26,8 +24,6 @@ __all__ = [
 MODELS = {
     "rwkv7": ("sunnynet.runtime.rwkv7", "RWKV7"),
     "mamba2": ("sunnynet.runtime.mamba2", "Mamba2"),
-    "deltanet": ("sunnynet.runtime.deltanet", "DeltaNet"),
-    "gla": ("sunnynet.runtime.gla", "GLA"),
 }
 
 
@@ -192,7 +188,7 @@ def step(a, b, s, gated=False):
 
 
 def mat_step(S, w=None, u=None, v=None, k=None, b=None, r=None):
-    """矩阵值 rank-1 递推单步 (RWKV-7 / DeltaNet 的矩阵状态层级).
+    """矩阵值 rank-1 递推单步 (RWKV-7 的矩阵状态层级).
 
     S: (NH,R,C) 原地更新; w/u/k/b/r: (NH,C); v: (NH,R)。任一项传 None 即跳过,
     语义见 recur.h 的 sn_mat_scan。返回 y (NH,R)(r 为 None 时返回 None)。

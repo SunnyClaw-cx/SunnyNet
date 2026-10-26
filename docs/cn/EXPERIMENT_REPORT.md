@@ -2189,6 +2189,11 @@ python -X utf8 experiments/_decode_seven.py 256,512,1024,2048,4096 2  # §23.3 �
 
 独立于 PyTorch 的 C 推理内核，目录 `sunnynet/runtime/`，只依赖 ctypes 与 C 编译器。
 
+> 口径：本章 §24.12 起的 Mamba-2 / DeltaNet / GLA / HGRN2 实测数据是**历史记录**。
+> 2026-10-26 起对外支持列表收敛为 RWKV-7 与 Mamba-2 两个架构，GLA / DeltaNet / HGRN2
+> 的代码与 CLI 分派已移除（三者权重 ≥1.37 GB，C 化收益已贴带宽墙）。本章数据保留，
+> 作为架构取舍的依据与可复现证据。
+
 ### 24.1 统一递推形式
 
 ```

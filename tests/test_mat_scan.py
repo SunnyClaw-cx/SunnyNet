@@ -1,6 +1,6 @@
 """矩阵值 rank-1 递推内核 (sn_mat_scan) 的数值契约.
 
-对应 RWKV-7 / DeltaNet 的矩阵状态层级: S += v x k 这类外积累加无法用元素级
+对应 RWKV-7 的矩阵状态层级: S += v x k 这类外积累加无法用元素级
 递推表达。内核按 head 串行、沿 C 向量化, 参数传 NULL 即跳过该项。
 """
 from __future__ import annotations
@@ -58,8 +58,8 @@ def test_rwkv7_full_form():
     assert dS < 1e-5 and dY < 1e-5
 
 
-def test_deltanet_no_decay():
-    """w=None: DeltaNet 无衰减门的形式。"""
+def test_no_decay():
+    """w=None: 无衰减门的形式。"""
     rng = np.random.default_rng(2)
     dS, dY = _case(
         3, 16, 24, seed=2, w=None,

@@ -309,39 +309,20 @@ def _dn_layers(hf_dir: str) -> int:
 
 
 def _main_hf(args) -> int:
-    """HF 权重目录路径 (Mamba-2 / DeltaNet), 不经 PyTorch 前向."""
+    """HF 权重目录路径 (Mamba-2), 不经 PyTorch 前向."""
     import numpy as np
 
     if args.hf_arch == "mamba2":
         from .runtime.mamba2 import Mamba2 as Model
-    elif args.hf_arch == "deltanet":
-        from .runtime.deltanet import DeltaNet as Model
-    elif args.hf_arch == "gla":
-        from .runtime.gla import GLA as Model
-    elif args.hf_arch == "hgrn2":
-        from .runtime.hgrn2 import HGRN2 as Model
     else:
         raise SystemExit(f"未支持的 --hf-arch: {args.hf_arch}")
 
     t0 = time.perf_counter()
     c_arch = args.hf_arch if _use_c_backend(args) else None
-    if c_arch == "deltanet":
-        # 整模型 C 内核: 前向全在 C, 与 numpy 参考路径逐 token 一致
-        from .runtime.deltanet_c import SnDeltaNet
-        m = _CAdapter(SnDeltaNet(args.blob, _dn_vocab(args.blob, args.hf_dir),
-                                 threads=args.threads), args.hf_dir)
-    elif c_arch == "mamba2":
+    if c_arch == "mamba2":
         from .runtime.mamba2_c import SnMamba2
         m = _CAdapter(SnMamba2(args.blob, _dn_vocab(args.blob, args.hf_dir),
                                threads=args.threads), args.hf_dir)
-    elif c_arch == "gla":
-        from .runtime.gla_c import SnGLA
-        m = _CAdapter(SnGLA(args.blob, _dn_vocab(args.blob, args.hf_dir),
-                            threads=args.threads), args.hf_dir)
-    elif c_arch == "hgrn2":
-        from .runtime.hgrn2_c import SnHGRN2
-        m = _CAdapter(SnHGRN2(args.blob, _dn_vocab(args.blob, args.hf_dir),
-                              threads=args.threads), args.hf_dir)
     else:
         m = Model(args.hf_dir)
     load_s = time.perf_counter() - t0
@@ -598,7 +579,7 @@ def _add_infer_args(ap, *, gguf_backend_default: str = "numpy"):
                     help="--gguf 时的执行后端; c = C 内核整模型单步")
     ap.add_argument("--blob", default=None,
                     help="C 内核权重 blob: RWKV-7 的 --gguf-backend c 用它, "
-                         "或 --hf-arch deltanet|mamba2|gla|hgrn2 时指向对应的 .c.bin "
+                         "或 --hf-arch mamba2 时指向对应的 .c.bin "
                          "(整模型前向在 C); 单独给出时按 RWKV-7 blob 直接推理")
     ap.add_argument("--vocab", type=int, default=0,
                     help="单独用 --blob 时的词表大小 (默认 65536)")
@@ -608,7 +589,7 @@ def _add_infer_args(ap, *, gguf_backend_default: str = "numpy"):
                     help="--backend c 时把 GEMV 权重与 head 载入为 fp16; "
                          "读字节减半, 单步约快 1.3x, logits 相对偏差约 7e-4")
     ap.add_argument("--hf-dir", default=None,
-                    help="HF 权重目录 (Mamba-2 / DeltaNet / GLA / HGRN2), 与 --ckpt/--gguf 三选一")
+                    help="HF 权重目录 (Mamba-2), 与 --ckpt/--gguf 三选一")
     ap.add_argument("--hf-arch", choices=list(HF_ARCHES),
                     default="mamba2",
                     help="--hf-dir 的架构")

@@ -228,7 +228,7 @@ def main(argv=None) -> int:
     ap.add_argument("--quant", choices=["fp32", "int4"], default="int4")
     ap.add_argument("--blob", default=None)
     ap.add_argument("--hf-dir", default=None)
-    ap.add_argument("--hf-arch", choices=list(HF_ARCHES), default="gla")
+    ap.add_argument("--hf-arch", choices=list(HF_ARCHES), default="mamba2")
     ap.add_argument("--tokenizer-dir", default=None)
     ap.add_argument("--threads", type=int, default=0, help="0 = 不限制")
     ap.add_argument("--host", default="127.0.0.1")

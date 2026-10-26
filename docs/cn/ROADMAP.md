@@ -21,10 +21,17 @@
 
 1. 只做 CPU：AVX2 / FMA 是已验证基线；AVX-512 与 NEON 提供源码与加载层，不做 CUDA 后端。
    理由：通用 GPU 推理栈（vLLM / TensorRT-LLM）是别人的主场。
-2. 只做线性复杂度架构：RWKV-7 / Mamba-2 / GLA / DeltaNet / HGRN2。标准 Transformer 不在范围内。
+2. 只做线性复杂度架构，且只保留 2 个：RWKV-7 与 Mamba-2。标准 Transformer 不在范围内。
+   理由：2 个"CPU 上公认最快"胜过 6 个"支持但都不最快"——后者是玩具合集，前者是行业标准。
+   GLA / DeltaNet / HGRN2 曾接入并留下完整实测记录（见 `EXPERIMENT_REPORT.md`），
+   三者的权重均 ≥1.37 GB、C 化收益已贴带宽墙（1.01× / 1.10× / 1.29×），故移出支持列表。
 3. 顺序：先把外部权重的加载与执行做快，再谈自有模型。当前所有已交付的速度数字都来自
-   外部权重（RWKV-7 191M、Mamba-2 130M、DeltaNet 340M、GLA 340M）。
-4. 不做 GUI、不做训练框架、不做多模态。`serve.py` / `ollama.py` 只提供 HTTP 接口，不含前端。
+   外部权重（RWKV-7 191M、Mamba-2 130M）。
+4. 不做 GUI、不做训练框架、不做多模态、不做聊天 UI/Oobabooga 插件。
+   `serve.py` / `ollama.py` 只提供 HTTP 接口，不含前端。
+5. 不维护自有权重格式：长期以 GGUF（或 safetensors + HF 标准）为权威格式，
+   自有 `.runtime.bin` 只作本地缓存。
+6. 热路径不迁回 Python/PyTorch：护城河是无 PyTorch 的 C 内核。
 
 仓库内自查（可复现）：
 

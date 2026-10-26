@@ -17,14 +17,22 @@ Numbers that have no verification environment here are marked as pending and are
 | AVX-512 / NEON kernels | Code + semantic equivalence verified, **speed pending** | §3 |
 | Raspberry Pi / Apple Silicon / RK3588 | **No verification environment** | §4 |
 
-## 1. The four boundaries
+## 1. The boundaries
 
 1. CPU only. AVX2 + FMA is the verified baseline; AVX-512 and NEON ship as source plus a loader.
    No CUDA backend — general GPU inference (vLLM / TensorRT-LLM) belongs to other projects.
-2. Linear complexity only: RWKV-7 / Mamba-2 / GLA / DeltaNet / HGRN2. Standard Transformers are out of scope.
+2. Linear complexity only, and only two: RWKV-7 and Mamba-2. Standard Transformers are out of scope.
+   Two architectures that are fastest on CPU beat six that are supported but not fastest — the latter
+   is a toy collection, the former is a standard. GLA / DeltaNet / HGRN2 were integrated and left a
+   full record of measurements (`EXPERIMENT_REPORT.md`); all three carry weights ≥1.37 GB whose C
+   speedup is already at the bandwidth ceiling (1.01× / 1.10× / 1.29×), so they leave the support list.
 3. Order: make loading and running foreign weights fast first. Every speed number below comes from
-   foreign weights (RWKV-7 191M, Mamba-2 130M, DeltaNet 340M, GLA 340M).
-4. No GUI, no training framework, no multimodal. `serve.py` / `ollama.py` expose HTTP only.
+   foreign weights (RWKV-7 191M, Mamba-2 130M).
+4. No GUI, no training framework, no multimodal, no chat UI or Oobabooga plugin.
+   `serve.py` / `ollama.py` expose HTTP only.
+5. No bespoke weight format: GGUF (or safetensors + HF standard) is the authoritative format long
+   term; the internal `.runtime.bin` is a local cache only.
+6. Keep the hot path out of Python/PyTorch: the moat is a C kernel with no PyTorch.
 
 Self-check (reproducible):
 
