@@ -2980,6 +2980,63 @@ judged stale, no manifest without misjudgment, missing source without misjudgmen
 rebuild, every module providing `_link_cmd` and `DLL`, and reverse coverage (every `*_c.py` is in `MODULES`).
 Case names are all taken from module attributes, so they run cross-platform.
 
+### 24.14 Attribution check for channel gating: the "softmax Jacobian has a $1/d$" claim does not hold
+
+An early design attributed the depth gradient decay to "the softmax Jacobian contains a $1/d$ factor,
+discounting once per layer, so deep stacking must kill the gradient", and on that basis switched channel
+competition from softmax to intra-group pairwise competition. This section checks the attribution with an
+operator-level and a model-level measurement.
+
+Script `experiments/_gate_originality.py jac|grad`, results `experiments/results/_gate_originality_{jac,grad}.json`.
+
+**(1) Operator-level Jacobian spectral norm** (fp64, `torch.autograd.functional.jacobian`, `||J||₂`):
+
+| d | pairwise | softmax | scalar | none |
+|---|---|---|---|---|
+| 16 | 0.44 | 0.32 | 0.25 | 0 |
+| 64 | 0.46 | 0.35 | 0.25 | 0 |
+| 128 | 0.48 | 0.31 | 0.25 | 0 |
+| 256 | 0.48 | 0.35 | 0.25 | 0 |
+| 512 | 0.48 | 0.39 | 0.25 | 0 |
+
+The softmax Jacobian spectral norm **rises** with d (0.32 → 0.39); there is no 1/d decay, and its median
+is about 0.35, not 0. Pairwise competition is 0.44 → 0.48, also O(1). The two have no order-of-magnitude gap,
+so the original argument does not hold.
+
+**(2) Model-level embedding gradient norm** (dim=128, 2/4/8/16 layers, one forward-backward):
+
+| gate | L2 | L4 | L8 | L16 |
+|---|---|---|---|---|
+| pairwise | 1.08 | 1.11 | 1.19 | 1.26 |
+| softmax | 1.07 | 1.10 | 1.16 | 1.22 |
+| scalar | 1.03 | 1.03 | 1.04 | 1.07 |
+
+The gradient does not decay with depth (at 16 layers it is still slightly above 2 layers), and pairwise vs
+softmax differ by ~3%, within the same magnitude. The original "0.018× decay, exactly zero at 16 layers" is
+not reproduced.
+
+**Conclusion**: the real causes of the depth gradient decay were the inverted spectral-radius sign (§4) and
+the missing residual (§5), both since corrected. The pairwise competition gate is kept, but for the engineering
+tradeoff (two sigmoids versus softmax's max-subtract and exp, one fewer reduction), no longer as a "fix for
+dying gradients". README (both languages) and ARCHITECTURE §1(c) have been corrected accordingly.
+
+**(3) Quality comparison of gate forms**: the same harness (dim=128, 4 layers, 600 steps, lr 3e-3, zh_ancient, 3 seeds)
+with four gates, measured by val ppl:
+
+| gate | seed 1234 | seed 7 | seed 2024 | mean |
+|---|---|---|---|---|
+| pairwise (current) | 332.11 | 329.67 | 318.06 | 326.61 |
+| softmax (original) | 331.37 | 321.75 | 330.77 | 327.96 |
+| scalar sigmoid | 326.37 | 318.43 | 331.02 | 325.27 |
+| none | 362.43 | 371.98 | 373.87 | 369.42 |
+
+**Conclusion**: the pairwise differences among the three gates (mean spread 2.7) are far smaller than the
+seed-to-seed spread (11–14 for a single gate) and the gap to none (~43). That is: **having a gate is what matters
+(no gate is ~43 ppl worse), while the quality differences among the three gate forms are within noise and do not
+constitute evidence that pairwise beats softmax/scalar**. The pairwise competition gate is kept for the engineering
+tradeoff (two sigmoids versus softmax's max-subtract and exp), not a quality gain. With 3 seeds this is a weak
+directional read, not a significance claim.
+
 ---
 
 ## 25. 100M-scale training, weight release, and Agent ecosystem integration
@@ -3272,7 +3329,118 @@ timing on the GPU side):
   (`CPU_WAY_OUT.md` §4), crossover at T≈2048, and at T=8192 CPU is 2.97× faster. This is where
   the CPU-native model lands.
 
-### 26.7 Reproduction
+### 26.7 Associative-memory write rules: soft vs. delta, and write-key alignment
+
+`AssocMemory`'s write has two switchable knobs: **what to write** (soft convex combination / delta
+overwrite) and **which key to write with** (current position / previous position). This section
+separates the two with the same harness.
+
+**(1) Relative error in the overwrite scenario** (`experiments/_assoc_overwrite.py`, 8 keys written,
+then 4 of them overwritten):
+
+| Rule | Overwritten keys (relative error) | Keys left intact |
+|---|---|---|
+| soft (`p`=0.1 / 0.5 / 0.9) | 0.747 / 0.765 / **0.916** | 0.942–1.004 |
+| delta ($β$=1.0) | **0.063** | 0.200 |
+
+The soft write multiplies the injected term by $(1-p)$, so writing the same key repeatedly only
+accumulates and reads back a mix of old and new; the delta write first subtracts the key's old
+association, then writes the new value, so it overwrites exactly. **This is the one mechanism-based
+argument for the delta write that holds up.**
+
+**(2) The chunked form of delta** (`experiments/_chunk_delta.py`): delta was believed to require
+per-token serial execution and to destroy the $O(N)$ parallel scan. That was wrong — delta has a WY
+chunked form (in-block $S_t = S_{\text{in}} + K_{0:t}^{\top}W_{0:t}$,
+$W=(I+L)^{-1}\operatorname{diag}(β)(V-K S_{\text{in}})$, $L_{ij}=β_i(k_i\cdot k_j)$ lower triangular),
+implemented as `ops.chunk_delta_scan`. It matches the sequential delta to **1e-16 in fp64** (any
+chunk size 4/8/16, with or without decay, all $\le 8.9\times10^{-16}$). The cost is one extra
+$C\times C$ triangular solve per block. The delta rule and the WY representation belong to
+DeltaNet / FLA, not this project.
+
+**(3) Write-key alignment is a necessary condition** (`experiments/_assoc_ab.py overwrite`, $d$=64,
+2 layers, 800 steps, B32/T64, slots 32×m 16, 3 seeds):
+
+| Write key | Rule | seed 1234 | seed 7 | seed 2024 |
+|---|---|---|---|---|
+| current position | soft | 0.036 | 0.078 | 0.034 |
+| **previous position** | soft | **0.808** | **0.895** | **0.902** |
+| current position | delta | 0.036 | 0.041 | 0.056 |
+| **previous position** | delta | **0.919** | **0.933** | **0.920** |
+| — | off (memory disabled) | 0.036 | 0.033 | 0.034 |
+
+Chance is $1/32=0.031$. **Consistent across three seeds**: with the write key taken from the current
+position both rules fall back to chance (0.034–0.078); only with the previous position do they rise
+(soft 0.81–0.90, delta 0.92–0.93). The mechanism is structural — a write is meant to express a
+(key → value) association, but at the moment the key is recognized the value has not been seen; if
+k/v/q all come from the current position the memory can only express token → token associations, so
+the association cannot be written at all. The `off` row shows the main path cannot solve this task
+($\approx$ chance), so the task is hard enough. **Write-key alignment is not an optional
+optimization — it is the precondition for either overwrite write to work.**
+
+**(4) MQAR comparison** (same harness, n\_pair=4, 3 seeds):
+
+| Rule | seed 1234 | seed 7 | seed 2024 |
+|---|---|---|---|
+| off | 0.033 | 0.023 | 0.034 |
+| soft | 0.936 | 0.950 | 0.959 |
+| delta | 0.961 | **0.014** | 0.955 |
+
+On MQAR, soft and delta are close in two of three seeds (within $<1.2\%$) — **weak discriminative
+power**; but delta collapses to **0.014 (below chance)** in seed 7, the same source as the divergence
+in §26.7(5), the stability cost of delta.
+
+**(5) Real-corpus ppl and the stability cost** (`experiments/_assoc_ab.py ppl`, $d$=128, 4 layers,
+600 steps, zh\_ancient, 3 seeds):
+
+| Rule | seed 1234 | seed 7 | seed 2024 | Mean |
+|---|---|---|---|---|
+| soft | 332.05 | 324.03 | 354.97 | 337.02 |
+| delta | 342.35 | 331.25 | 347.85 | 340.48 |
+
+delta is higher than soft by **3.47 (+1.0%)** on average, but the per-seed direction is not
+consistent (+10.3 / +7.2 / −7.1) and is far smaller than the within-group spread (soft 30.94 /
+delta 16.60) ⇒ **read as slightly worse, within seed noise**, not a quality advantage.
+
+The stability cost of delta is localized (`ops._safe_chunk_delta`): in fp32, chunk=64 produces
+**non-finite decay gradients** in the backward pass (`torch.autograd` anomaly detector reports
+`AminBackward0` — `amin`'s backward multiplies inf into non-argmin positions, giving nan), diverging
+in 2/3 seeds (steps 237 / 249); lowering the block length to $\le 32$ gives 3/3 pass; fp64 is stable
+throughout. The chunked form itself matches the sequential to 1e-16, and the cap does not change the
+forward semantics.
+**Reading**: the delta write has a real gain on overwrite recall (+12–16% vs. soft, reproduced 3/3),
+at the cost of being numerically more fragile in fp32 (needs the block cap) and more seed-sensitive
+(MQAR seed 7 collapse). On general language modeling the two do not differ significantly.
+
+**(6) Training-step cost and decoder cost of the delta write** (`experiments/_assoc_ab_speed.py`,
+$d$=128, $L$=4, one independent subprocess per cell, interleaved rounds):
+
+| slots×m | B×T | soft ms/step | delta ms/step | delta/soft |
+|---|---|---|---|---|
+| 32×16 | 8×512 | 1671.8 / 1625.9 / 1624.4 | 1488.3 / 1446.6 / 1372.5 | **0.89 / 0.89 / 0.84** |
+| 64×32 | 8×256 | 1546.7 / 1610.0 | 1003.0 / 938.2 | **0.65 / 0.58** |
+| 128×64 | 4×256 | 2347.5 / 2304.0 / 2385.7 | 1198.1 / 1287.1 / 1489.3 | **0.51 / 0.56 / 0.62** |
+
+**The chunked delta write is faster than the soft write, and the gap widens with slots×m** (3/3,
+2/2, 3/3 rounds). Attribution at operator level (B8/T512, slots 32×m 16, single thread, timing
+`AssocMemory.forward`): soft materializes the outer product into a $(B,T,\text{slots}\cdot m)$ tensor
+and hands it to `logspace_scan`, whose `log`/`cumsum`/`exp` all run at width 512 — `cumsum` alone
+costs 13.05 ms, 38% of soft's 34.27 ms; delta keeps the state at $(\text{slots},m)$, dropping the
+elementwise work to width 32 and 16, at the price of one extra $C\times C$ triangular solve per block
+($C\le32$). The same operator-level comparison reads soft 34.27 ms vs. delta 21.32 ms (0.62×).
+Parameter cost is marginal: delta adds only `W_b` (dim+1) per associative layer — **+516 parameters
+(+0.034%)** on the small-like stack (1,538,840 vs. 1,538,324).
+
+**Decoder cost** (B=1, single step, slots 32×m 16, 4 interleaved rounds):
+soft 9.006 / 9.717 / 11.559 / 9.104 ms, delta 8.172 / 8.335 / 7.503 / 9.912 ms (3/4 favour delta).
+The step path evaluates both rules token-by-token; the difference here is inside the run-to-run
+spread, so the decoder reads as **comparable** rather than faster.
+
+**Boundary observation (pre-existing, not from this change)**: `assoc_slots=128, assoc_m=64` with
+B=8/T=512 training **segfaults the interpreter**; the same crash reproduces on a clean `git archive`
+of the HEAD tree, so it is not introduced here. The 32×16 and 64×32 configurations used above are
+unaffected, and B=4/T=512 at 128×64 also passes.
+
+### 26.8 Reproduction
 
 ```sh
 python -X utf8 experiments/_assoc_layers.py                      # §26.1 per-layer cost
@@ -3294,7 +3462,169 @@ python -X utf8 experiments/_converge_compare.py --tag assoc2_small_zh --assoc --
 python -X utf8 experiments/_converge_compare.py --tag tf_small_zh --arch transformer
 python -X utf8 train/evaluate.py --ckpt runs/<tag>.pt --gen --out runs/<tag>_eval.json
 python -X utf8 experiments/_gpu_compare.py                       # §26.6 (needs GPU env vars)
+# §26.7 write rules and write-key alignment
+python -X utf8 experiments/_chunk_delta.py                       # chunked delta vs sequential (fp64)
+python -X utf8 experiments/_assoc_overwrite.py                   # soft vs delta write overwrite
+python -X utf8 experiments/_assoc_ab.py overwrite 800 1234       # overwrite recall A/B (3 seeds)
+python -X utf8 experiments/_assoc_ab.py mqar      800 1234       # MQAR A/B
+python -X utf8 experiments/_assoc_ab.py ppl       600 1234       # real-corpus ppl A/B
+python -X utf8 experiments/_assoc_ab_speed.py delta_scalar 512 32 16 12  # §26.9 write-rule cost
+python -X utf8 experiments/_decay_reduce.py                      # §26.9 reduction-direction conditioning
+python -X utf8 experiments/_chunk_bounds.py                      # §26.9(7)(8) block bounds and guard
 ```
+
+### 26.9 Decay-reduction numerical defect: the `amin` scalar collapse and a scalar decay head
+
+The delta write of §26.7 left a pit in one implementation detail: the chunked form only accepts a
+**scalar** decay, while the per-channel decay head `W_g` produces $(B,T,m)$, so every step runs
+`amin(dim=-1)` to collapse it to $(B,T)$. That single reduction causes three consequences.
+
+**(1) The numerical cost of the reduction direction** (`experiments/_decay_reduce.py`, $d$=128,
+$B$=8, $T$=256, slots 32×m 16):
+
+| Reduction | Peak $1/\prod d$ at chunk 32 | Peak at chunk 64 |
+|---|---|---|
+| `amin` (fastest-forgetting channel) | 3.15e8 | **9.92e16** |
+| `amax` (slowest-forgetting channel) | 1.34 | **1.78** |
+
+The block computes $1/\prod_{i\le t} d_i$, of order $d_{\min}^{-L}$. `amin` takes the **smallest**
+keep-rate in the group (the fastest-forgetting channel), driving that denominator down and the
+condition number up: at chunk 64 it reaches 9.92e16, only 21 dB below the fp32 ceiling of 3.4e38.
+With `amax` the same block length gives **1.78**.
+
+**(2) Wasted parameters**: `W_g` is `dim→m` ($m$=16, 2048 parameters per layer) producing 16 channels
+of decay, of which the reduction keeps exactly one (the `amin` result) — **15/16 of the output is
+discarded**.
+
+**(3) Seed-dependent collapse**: which channel `amin` picks depends on the data and switches during
+training; gradients are discontinuous around the switch, showing up as individual seeds (MQAR seed 7)
+dropping to 0.014, below chance.
+
+**Fix: `assoc_decay="scalar"`.** The chunked form requires a scalar decay by construction, so output a
+scalar directly: a new `W_gd(dim→2)` yields (keep-rate $p$, write strength $\beta$) in one linear, with
+no reduction and no per-channel head. Critically, $p$ must use the **same H parameterization** as the
+per-channel head:
+
+$$\delta = \frac{1}{h_{\max}} + \left(\frac{1}{h_{\min}} - \frac{1}{h_{\max}}\right)\sigma(g),
+\quad p = 1 - \delta \;\ge\; 1 - \frac{1}{h_{\min}}$$
+
+($p\ge0.5$ with $h_{\min}$=2). With a bare $\sigma$ the model can drive $p$ to 0.01 and $1/\prod p$
+explodes — exactly why the first implementation moved the collapse from seed 7 to seed 2024. Once the
+parameterization is aligned, $p$ has a hard lower bound and the block length needs no conservative cap.
+
+**(4) Three measured comparisons** ($d$=128, 4 layers, 3 seeds, same harness):
+
+Overwrite recall (800 steps, chance 1/32=0.0312):
+
+| Rule | seed 1234 | seed 7 | seed 2024 | Mean |
+|---|---|---|---|---|
+| soft | 0.8078 | 0.8953 | 0.9016 | 0.8682 |
+| delta+`amin` | 0.9187 | 0.9328 | 0.9203 | 0.9239 |
+| **delta+scalar** | **0.9203** | **0.9328** | **0.9234** | **0.9255** |
+
+MQAR (800 steps):
+
+| Rule | seed 1234 | seed 7 | seed 2024 | Mean |
+|---|---|---|---|---|
+| soft | 0.9359 | 0.9500 | 0.9594 | 0.9484 |
+| delta+`amin` | 0.9609 | **0.0141** | 0.9547 | 0.6432 |
+| **delta+scalar** | **0.9469** | **0.9484** | **0.9406** | **0.9453** |
+
+The `amin` seed collapse (seed 7 dropping to 0.0141) **disappears** under scalar (0.9484); scalar's
+three-seed spread is 0.0083 against `amin`'s 0.9468. Its mean is slightly below `amin`'s non-collapsing
+seeds (0.9453 vs 0.9578) because scalar constrains $p$ into $[0.5, 1)$ — **trading a little peak for
+never collapsing**.
+
+Real-corpus ppl (600 steps, zh_ancient):
+
+| Rule | seed 1234 | seed 7 | seed 2024 | Mean |
+|---|---|---|---|---|
+| soft | 332.05 | 324.03 | 354.97 | 337.02 |
+| delta+`amin` | 342.35 | 331.25 | 347.85 | 340.48 |
+| delta+scalar | **328.69** | 343.24 | **329.65** | **333.86** |
+
+scalar's mean is 3.16 below soft (−0.94%), but seed 7 goes the other way (+19.2) and the within-group
+spread (soft 30.94 / scalar 14.55) dwarfs the mean gap ⇒ **same reading as §26.7(5): within seed noise,
+not a quality advantage**.
+
+**(5) Parameters and consistency**:
+
+| Config | Total params | assoc layers | Δvs off |
+|---|---|---|---|
+| assoc off | 1,414,420 | 0 | 0 |
+| soft (original) | 1,538,324 | 58,368 | +123,904 |
+| delta+`amin` | 1,538,840 | 58,884 | +124,420 |
+| **delta+scalar** | **1,531,164** | 51,208 | +116,744 |
+
+scalar is **7,160 parameters below soft (−0.47%)** — the wasted per-channel head is gone. `reduce` and
+`scalar` agree to 3.8e-15 between `forward` and `step` in fp64.
+
+**(6) Cost** (slots 32×m 16, $d$=128, $L$=4, subprocess per cell, 3 interleaved rounds for training,
+5 for decode):
+
+| Rule | Training step ms (B8/T512) | Single-step decode ms (B=1) |
+|---|---|---|
+| soft | 1886.0 / 1841.0 / 1799.1 | 10.377 / 9.442 / 8.268 / 13.757 / 8.683 |
+| delta+`amin` | 1558.0 / 1596.4 / 1692.3 | 8.414 / 11.447 / 9.514 / 10.399 / 9.459 |
+| delta+scalar | 1633.9 / 1596.9 / 1546.6 | 8.120 / 9.150 / 9.884 / 9.015 / 7.973 |
+
+Training step: scalar's median of 1596.9 ms against soft's 1841.0 ms is **0.867×**, on par with
+`amin` (0.867×). Decode: scalar's median of 9.015 ms against soft's 9.442 ms is **0.955×**, winning
+**4/5** paired rounds — slightly better than the "comparable" reading for `amin` in §26.7(6), though
+soft's own spread reaches 5.5 ms, so it reads as **slightly better** rather than faster.
+
+**Conclusion**: the `amin` scalar collapse is the common root cause of three §26.7 weaknesses
+(parameters, stability, seed sensitivity); a scalar decay head fixes all three at once. The price is
+that the decay ceiling is now bound by the $h$ parameterization, so the MQAR peak is slightly below
+`amin`'s non-collapsing seeds. The default remains `reduce`; `scalar` is opt-in.
+
+**(7) Block length 32 is set by stability, not by speed** (`chunk` in `chunk_delta_scan`):
+
+`scalar` mode pins $p$'s structural floor at 0.5, so $d_{\min}^{-L}$ only reaches 1.84e19 at $L$=64,
+which looks like room to enlarge the block. Two separate checks give different answers:
+
+**On speed every block length ties; no ranking is resolvable.** Per-cell subprocesses, round-interleaved
+(`experiments/_chunk_bounds.py chunk`; $B$=8, $T$=512, slots 32×$m$ 16, $p$=0.9988), 22 readings pooled
+over two batches:
+
+| chunk | n | median ms | spread | vs 32 |
+|---|---|---|---|---|
+| **32** | 8 | 61.27 | 11.57 | 1.00× |
+| 48 | 5 | 69.27 | 14.09 | 1.13× |
+| 64 | 5 | 65.10 | **34.55** | 1.06× |
+| 128 | 4 | 66.97 | 13.12 | 1.09× |
+
+The median gap (3.8 ms between 32 and 64) is far below 64's own spread (34.55 ms), and round-paired
+results flip between batches (3/4 in one, 2/4 tie in the other). **Measuring block-length ranking inside
+a single process produces false differences** — the same 64 configuration was recorded at both 50.67 and
+85.22. This is the noise floor for this workload, not a speed advantage.
+
+**On stability 32 is a hard boundary.** At $p$=0.5 the length-64 block already yields non-finite decay
+gradients (forward stays OK; $1/\prod d$ overflows the backward), and $L$=128 is NaN even in the forward
+pass. Sweeping block length gives a maximum stable value of $L$=62, which offers no gain since speed
+there is indistinguishable from 32.
+
+So `cap=32` is set by stability: it sits inside the stable region and is not slower. What had been
+treated as a "conservative compromise" is in fact a requirement.
+
+**(8) The guard's headroom was 30 bits wider than the measured safety level**:
+
+The analytic guard reverses $\bar d^{-L}\le 2^{\text{headroom}}$ for $L$ and originally used
+headroom=80. The measured threshold sits between $2^{57}$ and $2^{62}$ (the "max safe $L$" column is
+swept block length by block length):
+
+| $p$ | max safe $L$ | $2^{\log_2(1/\bar d^L)}$ |
+|---|---|---|
+| 0.3 | 36 | 62.5 |
+| 0.4 | 46 | 60.8 |
+| 0.5 | 62 | 62.0 |
+| 0.6 | 78 | 57.5 |
+| 0.7 | 78 | 40.1 |
+
+With headroom=80 the guard returned $L$=24/34 for $p$=0.1/0.2, and both produce non-finite decay
+gradients. With headroom=50 every $p\in[0.05,0.9]$ satisfies $\bar d^{-L}\le 2^{50}$ and is stable in
+measurement. On the production path $p\ge 0.5$, so by_cond is always $\ge 50 > \text{cap}=32$ and the
+block length is unchanged — this fix only affects direct `chunk_delta_scan` calls with $p<0.5$.
 
 ---
 
@@ -3559,6 +3889,21 @@ python -X utf8 experiments/_deltanet_int4_equiv.py           # §24.12(14) Delta
 python -X utf8 -m pytest tests/test_hgrn2_c.py -v
 python -X utf8 -m pytest tests/test_gla_c.py -v
 python -X utf8 -m pytest tests/test_deltanet_c.py -v
+```
+
+### Gate attribution and associative-memory write rules (§24.14 / §26.7)
+
+```bash
+python -X utf8 experiments/_gate_originality.py jac               # §24.14(1) operator-level Jacobian spectral norm
+python -X utf8 experiments/_gate_originality.py grad              # §24.14(2) model-level embedding gradients
+python -X utf8 experiments/_gate_originality.py train 600 1234    # §24.14(3) gate-form quality (3 seeds)
+python -X utf8 experiments/_chunk_delta.py                        # §26.8 chunked delta vs sequential
+python -X utf8 experiments/_assoc_overwrite.py                    # §26.8 soft vs delta write overwrite
+python -X utf8 experiments/_assoc_ab.py overwrite 800 1234        # §26.8 overwrite recall A/B (3 seeds)
+python -X utf8 experiments/_assoc_ab.py mqar      800 1234        # §26.8 MQAR A/B
+python -X utf8 experiments/_assoc_ab.py ppl       600 1234        # §26.8 real-corpus ppl A/B
+python -X utf8 experiments/_assoc_ab_speed.py soft 512 32 16 12   # §26.8 write-rule cost (subprocess per cell)
+python -X utf8 -m pytest tests/test_architecture.py -v
 ```
 
 > GGUF weights and the exported blobs are large, fetched on demand via `experiments/gguf/`, not distributed with the repository.

@@ -2,6 +2,66 @@
 
 # Changelog
 
+## Unreleased
+
+### Associative memory: delta write, write-key alignment, and numerical boundary
+- `AssocMemory` gains `assoc_write='delta'`: `S_t = p⊙S_{t-1} − β k_t(k_tᵀS_{t-1}) + β(v_t⊗k_t)`,
+  subtracting the key's old association before writing the new value, so it overwrites a key exactly.
+  The soft (convex-combination) write reads back mostly the old value on overwrite recall
+  (relative error 0.75–0.92); delta reads back the new value (0.06).
+- Chunked form `ops.chunk_delta_scan` (WY: `W=(I+L)⁻¹diag(β)(V−K S_in)`, L lower triangular), matching
+  the sequential delta to 1e-16 in fp64 (any chunk size, with or without decay). The delta rule and the
+  WY representation belong to DeltaNet / FLA.
+- `_safe_chunk_delta` caps the block length at 32: in fp32, chunk=64 produces non-finite decay gradients
+  in the backward pass (anomaly detector points to `AminBackward0`), diverging in 2/3 seeds (steps 237/249);
+  with the cap, 3/3 pass.
+- The write key is taken from the previous position (`assoc_shift`): with k/v/q all from the current
+  position the memory can only express token → token associations and cannot store (key → value). This is
+  why early recall experiments left both write rules at chance (0.02 vs. 1/32); after the fix, MQAR gives
+  off 0.033 / soft 0.936 / delta 0.961.
+- Training-step cost (`experiments/_assoc_ab_speed.py`, subprocess per cell, interleaved rounds): the
+  chunked delta write is *cheaper* than the soft write — soft materializes the outer product into a
+  (B,T,slots·m) tensor and scans it, so log/cumsum/exp all run at width slots·m (cumsum alone is 38%
+  of soft's time), while delta keeps the state at (slots,m) and only solves one C×C triangular system
+  per block. delta/soft training step = 0.84–0.89× (32×16) / 0.58–0.65× (64×32) / 0.51–0.62× (128×64),
+  at a parameter cost of one `W_b` (+516, +0.034%).
+- **`assoc_decay='scalar'`**: the chunked delta accepts only a scalar decay, and the code collapsed the
+  per-channel head `W_g`'s $(B,T,m)$ output to $(B,T)$ with `amin` — taking the fastest-forgetting
+  channel, driving the block's peak $1/\prod d$ condition number to **9.92e16** at chunk=64 (against
+  1.78 for `amax`) while keeping only 1 of 16 channels. Replaced by a dedicated `W_gd(dim→2)` that
+  outputs (keep-rate, write strength) directly with no reduction. $p$ follows the same H
+  parameterization as the per-channel head ($p \ge 1-1/h_{\min} = 0.5$); a bare $\sigma$ lets $p$ fall
+  to 0.01 and diverges (measured: it moved the collapse from seed 7 to seed 2024 — now fixed). After
+  the fix: **7,160 fewer parameters than soft (−0.47%)**, the MQAR seed collapse is gone
+  (seed 7: 0.0141 → 0.9484), overwrite recall and ppl do not regress, training step 0.867× and decode
+  0.955× (4 of 5 paired rounds).
+- `_safe_chunk_delta` now derives the block length from the actual decay ($d_{\min}^{-L} \le 2^{50}$).
+  The headroom was $2^{80}$, 30 bits wider than the measured safety level ($2^{57}$–$2^{62}$), and
+  returned $L$=24/34 for $p$=0.1/0.2, both of which produce non-finite decay gradients in measurement.
+  At $2^{50}$ every $p\in[0.05,0.9]$ is stable. On the production path ($p \ge 0.5$) by_cond is always
+  $\ge 50 > \text{cap}$, so the block length is unchanged.
+- Block length 32 is set by stability, not by speed: across 22 cross-process readings the median ratio
+  is 0.94× for 32/64 and 0.91× for 32/128, while 64's own spread (34.55 ms) dwarfs the 3.8 ms median
+  gap, so all block lengths tie on speed and no ranking is resolvable (ranking them inside one process
+  yields false differences). Stability is unambiguous: at $p$=0.5 the length-64 block already yields
+  non-finite decay gradients and $L$=128 is NaN in the forward pass. `cap=32` stays.
+- 4 new invariant tests: scalar-decay forward/step agreement, per-channel head not built, block length
+  shrinking with decay.
+- 1 new guard test: the reversed block length must satisfy $d_{\min}^{-L} \le 2^{50}$, pinning the
+  headroom against regression.
+- 15 new invariant tests: shift forward/step agreement, chunk invariance, causality, overwrite, block cap.
+
+### Gate attribution and originality notes
+- `experiments/_gate_originality.py`: the operator-level Jacobian spectral norm rises with d
+  (softmax 0.32→0.39, no 1/d decay); model-level gradients do not decay with depth. The earlier claim of
+  "softmax Jacobian's 1/d factor kills gradients" does not hold and has been corrected.
+- Gate-form quality comparison (dim=128, 4 layers, 600 steps, zh_ancient, 3 seeds): pairwise 326.61 /
+  softmax 327.96 / scalar 325.27 / none 369.42. The three gates differ far less than seed noise or the
+  no-gate gap: the presence of a gate is what matters; the form differences are within noise.
+- `docs/{cn,en}/ORIGINALITY.md` (new): prior work listed component by component, with the claimable scope marked.
+- README / ARCHITECTURE / CHANGELOG wording of "an original architecture that is not Transformer / RNN"
+  did not match measurement; changed to a linear-recurrence-family statement.
+
 ## v0.3.0
 
 ### The cost mechanism of depth scaling and new presets

@@ -6,7 +6,20 @@
 
 **English** · [中文](README.md)
 
-An original general-purpose sequence architecture, not derived from Transformer, RNN, Mamba, CNN, or any existing design.
+A CPU-first first-order linear-recurrence sequence architecture with a PyTorch-free inference runtime.
+
+The state update is a gated convex combination:
+
+```
+s_t = p_t ⊙ s_{t-1} + (1 - p_t) ⊙ u_t
+```
+
+This belongs to the linear-attention / linear-RNN / diagonal-SSM family — linear attention was proven
+equivalent to a linear RNN by Katharopoulos et al., 2020. What is specific to this project is the
+choice and combination of components, each with prior work to compare against (see
+[docs/en/ORIGINALITY.md](docs/en/ORIGINALITY.md)): pairwise in-group competition gating,
+log-uniform multi-scale retention, and cross-layer state relay. That family was chosen because it
+gives O(N) sequence complexity and constant-time single-step decode, the bandwidth-optimal shape on CPU.
 
 Repository: <https://github.com/SunnyClaw-cx/SunnyNet>
 
@@ -49,10 +62,13 @@ Full mathematical derivation: [docs/en/ARCHITECTURE.md](https://github.com/Sunny
 | Normalization | CenteredScaleNorm | Denominator has a smooth floor `s_min`, near-constant vectors are not amplified (precondition for deep stacking) |
 | Initialization | Spectral anchoring (QR orthogonal slices, σ_max anchored directly) | Condition number 1, flat forward-gain spectrum; ρ=1.0 calibrated by measurement |
 | Cross-layer transfer | State relay + feature residual stream | State scale does not grow with depth; residual direct path carries the depth gradient (measured −28% ppl) |
-| Channel competition | Intra-group pairwise competitive gating | Same semantics as softmax, but Jacobian is O(1) instead of O(1/d) |
+| Channel competition | Intra-group pairwise competitive gating | Same semantics as softmax, but two sigmoids instead of a max-subtract and an exp |
 | Parallel scan | Log-domain closed form | Algebraically equivalent to step-by-step recurrence; the block-head state can be recovered exactly from the block tail |
 
-No reuse of ReLU / GELU / SiLU / Mish, LayerNorm / RMSNorm / InstanceNorm / GroupNorm, Xavier / Glorot / He / MSRA initialization, LSTM / GRU gating formulas, or SSM / HiPPO discretization.
+The activation and normalization are self-designed: SoftWedge activation, CenteredScaleNorm, and
+spectral-anchoring initialization. The rest are common components: the state update is a gated convex
+combination (same shape as the GRU update), multi-scale forgetting is log-domain parameterized
+(as in RWKV-4 / KDA), and the gate uses sigmoid (as in Qwen's gated-attention findings).
 
 ### Measured results
 
@@ -132,7 +148,7 @@ The dimensions where SunnyNet lags or only ties — decode speed on the torch pa
 - Long-range retrieval is verified only on structured text (code, far-bucket hit 0.13); on natural language it is near zero.
 - No GPU kernel. The architecture runs on CUDA unmodified (8.0–15.2× forward on a GTX 1060), but there is no Triton or CUDA implementation.
 - On the torch decode path, speed is not competitive against O(N) peers: RWKV decodes 1.73–2.16× faster at every length tested. The shipped whole-model C runtime reverses this ordering (1st at every length); the two paths must be quoted separately.
-- Coherence ("incoherence") has two independent causes, both measured: a training-budget deficit (the external Kaggle run had 0.96 token/parameter against a Chinchilla suggestion of 20, a 20.8× gap) and a recall-capacity ceiling of the elementwise state (2 key-value pairs: recurrence 4.7% vs attention 93.4% accuracy). A same-budget controlled run shows the recurrence baseline at ppl 143.24 versus 140.40 for a Transformer with matched stack parameters — the gap is the budget, not the recurrence. Adding a semi-count associative-memory branch lowers zh ppl to 138.82 (−3.1%) and is the only configuration that improves generation coherence. Inter-layer dilution is a separate, depth-only effect: on a 100M checkpoint the input-specific energy share falls 0.226 → 0.035 from layer 0 to layer 7, and normalizing the state plus its feedback source raises 24-input argmax variety from 12 to 16 and lowers val ppl 200.51 → 198.33. Residual-stream normalization is falsified (ppl 263 → 625). The tail layer of that dilution is not yet resolved.
+- Coherence ("incoherence") has two independent causes, both measured: a training-budget deficit (the external Kaggle run had 0.96 token/parameter against a Chinchilla suggestion of 20, a 20.8× gap) and a recall-capacity ceiling of the elementwise state (2 key-value pairs: recurrence 4.7% vs attention 93.4% accuracy). A same-budget controlled run shows the recurrence baseline at ppl 143.24 versus 140.40 for a Transformer with matched stack parameters — the gap is the budget, not the recurrence. Adding a semi-count associative-memory branch lowers zh ppl to 138.82 (−3.1%) and is the only configuration that improves generation coherence. Inter-layer dilution is a separate, depth-only effect: on a 100M checkpoint the input-specific energy share falls 0.226 → 0.035 from layer 0 to layer 7, and normalizing the state plus its feedback source raises 24-input argmax variety from 12 to 16 and lowers val ppl 200.51 → 198.33. Residual-stream normalization is falsified (ppl 263 → 625). The tail layer of that dilution is not yet resolved. The memory branch's write rule is selectable: the soft convex-combination write reads back mostly the old value when a key is overwritten (relative error 0.75–0.92), while the delta write reads back the new value (0.06) and reaches 0.92 vs. 0.81 overwrite-recall accuracy — but the delta write needs the write key taken from the previous position, without which both rules stay at chance (0.03–0.08 vs. random 1/32).
 
 ### CPU inference runtime
 
@@ -236,17 +252,18 @@ st = m.reset(m.init_state())
 logits = m.step(token, st)                  # O(1) per step
 ```
 
-**Roadmap.** Existing assets: the original architecture, the AVX2 fused kernel (training step 1.10–1.17×), the generic recurrent C runtime (9.9× median against a vectorized baseline), whole-model C single-step decode (B=1 single thread 1.53–2.05×), cross-architecture mapping verification, GGUF read plus RWKV-7 weights (numerically equivalent to the official `.pth`), the RWKV-7 whole-model C kernel (5.39× over numpy, 7.49× at 8 threads), INT4 quantization (2.83× end-to-end), official Mamba-2 weights (numerically aligned, coherent greedy generation), AVX-512 and NEON kernel source (compiled, plus shim-executed equivalence), one-command GGUF into the C kernel (`sunnynet chat -m x.gguf`, blob exported and cached automatically), the `chat` / `serve` / `convert` / `quantize` / `info` subcommands, GGUF quantization with perplexity, the OpenAI-compatible server, a native Ollama API server, Ollama / LM Studio integration, and the stable C ABI. Near term: weight release via `sunnynet-release`. Mid term: a matrix-valued rank-1 recurrence kernel to bring RWKV-7 single-step into C (Mamba-2 can reuse the existing recurrence). Not planned: replicating llama.cpp's general tensor-operator layer, or matching Transformers / vLLM head-on. Verification protocols, items pending real hardware, and what was left out are in [docs/en/ROADMAP.md](https://github.com/SunnyClaw-cx/SunnyNet/blob/main/docs/en/ROADMAP.md).
+**Roadmap.** Existing assets: the architecture, the AVX2 fused kernel (training step 1.10–1.17×), the generic recurrent C runtime (9.9× median against a vectorized baseline), whole-model C single-step decode (B=1 single thread 1.53–2.05×), cross-architecture mapping verification, GGUF read plus RWKV-7 weights (numerically equivalent to the official `.pth`), the RWKV-7 whole-model C kernel (5.39× over numpy, 7.49× at 8 threads), INT4 quantization (2.83× end-to-end), official Mamba-2 weights (numerically aligned, coherent greedy generation), AVX-512 and NEON kernel source (compiled, plus shim-executed equivalence), one-command GGUF into the C kernel (`sunnynet chat -m x.gguf`, blob exported and cached automatically), the `chat` / `serve` / `convert` / `quantize` / `info` subcommands, GGUF quantization with perplexity, the OpenAI-compatible server, a native Ollama API server, Ollama / LM Studio integration, and the stable C ABI. Near term: weight release via `sunnynet-release`. Mid term: a matrix-valued rank-1 recurrence kernel to bring RWKV-7 single-step into C (Mamba-2 can reuse the existing recurrence). Not planned: replicating llama.cpp's general tensor-operator layer, or matching Transformers / vLLM head-on. Verification protocols, items pending real hardware, and what was left out are in [docs/en/ROADMAP.md](https://github.com/SunnyClaw-cx/SunnyNet/blob/main/docs/en/ROADMAP.md).
 
 ### Originality
 
-SunnyNet is an independent original architecture, with two points stated plainly:
+A component-by-component comparison against prior work is in [docs/en/ORIGINALITY.md](docs/en/ORIGINALITY.md). In short:
 
-- Its state recurrence is mathematically related to linear-attention work (both are first-order linear recurrences); this is not avoided.
-- The gating construction (convex combination + log-uniform multi-scale + per-element guard gate), the inter-layer transfer (state relay + feature residual stream), the activation, the normalization, and the initialization are all designed and calibrated here.
+- The state update is a gated convex combination, the same shape as the GRU update. First-order linear recurrence is the shared paradigm of linear attention / linear RNN / diagonal SSM since 2020; this project does not claim that paradigm as new.
+- Log-domain multi-scale forgetting with per-channel decay is used by RWKV-4 and KDA. Group gating and sigmoid gating were studied systematically in Qwen's gated attention (NeurIPS 2025).
+- Designed and calibrated here: the SoftWedge activation, CenteredScaleNorm, spectral-anchoring initialization, the specific form of the pairwise in-group competition gate, the cross-layer state relay, and the generic first-order-recurrence C kernel.
 - No code or structure from any existing project was referenced or ported.
 
-Four design conclusions were overturned by measurement and corrected: softmax channel competition drove the gradient to zero with depth; the sign of the spectral-radius depth decay was inverted; CenteredScaleNorm's `s_min` was above the actual activation scale, degrading normalization to a constant scale; and excluding the residual caused the largest single quality loss. The corrections and their data are in `docs/en/ARCHITECTURE.md` §3/4/5, kept to show where each design constraint came from.
+Design conclusions overturned by measurement: the sign of the spectral-radius depth decay was inverted (§4 of docs/en/ARCHITECTURE.md); CenteredScaleNorm's `s_min` was above the actual activation scale, degrading normalization to a constant scale (§3); and excluding the residual caused the largest single quality loss (§5). An early design attributed the depth gradient decay to softmax channel competition. Later measurement does not support that attribution — the Jacobian spectral norm of softmax **rises** with channel count (0.29 → 0.36 for d=16 → 512) and does not decay with depth; the real causes of the gradient decay were the inverted spectral-radius sign and the missing residual, both since corrected. Data in experiments/results/_gate_originality_jac.json.
 
 ### Quick start
 

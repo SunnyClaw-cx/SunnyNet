@@ -3,9 +3,9 @@
 *[English](../en/ARCHITECTURE.md)*
 
 > 本文档给出 SunnyNet 的全部数学定义与设计依据。
-> SunnyNet 为独立原创架构，**不基于** Transformer / RNN(LSTM/GRU) / Mamba(SSM) / CNN
-> 等任何既有神经网络范式，也不复用 ReLU/GELU/SiLU、LayerNorm/RMSNorm/InstanceNorm、
-> Xavier/Glorot/He/MSRA 初始化等既有方案。
+> SunnyNet 属于线性注意力 / 线性 RNN 家族——状态更新是带门控的凸组合，一阶线性递推是
+> 2020 年以来该赛道的共同范式。自分量在激活、归一化、初始化与门控的具体形式上；
+> 逐组件的先行工作对照见 [ORIGINALITY.md](ORIGINALITY.md)。
 
 ## 0. 设计出发点
 
@@ -73,12 +73,15 @@ u_t = u^{\text{raw}}_t \odot w_t
 $$
 
 $w_i < 1$ 使 $u_t$ 有界，这是后续"凸组合"保证状态不发散的前提。
-组内竞争表达了与 softmax 相同的"多通道争夺同一份资源"语义，但 **Jacobian 量级是 $O(1)$ 而非 $O(1/d)$**。
+选它而非 softmax 的理由是工程性的：softmax 要减去组内最大值再取指数，成对竞争只要两次
+sigmoid，少一次规约。两者都能表达"组内多通道争夺同一份资源"的语义。
 
-> **这一处是实测驱动的修正**：最初版本用 $\mathrm{softmax}(g_t)$ 做通道竞争，
-> 实测发现梯度范数随深度按约 $0.018$ 倍衰减，16 层后**精确归零**——
-> softmax 的 Jacobian 含 $1/d$ 因子，在 128 个通道上每层都打一次折，深堆叠必然梯度死绝。
-> 换成组内成对竞争后，$J$ 量级恢复为 $O(1)$。记录于此以说明设计约束的来源。
+> **一处修正留下的记录**：设计早期把深度梯度衰减归因于"softmax 的 Jacobian 含 $1/d$"，
+> 据此换成成对竞争。这个归因后来被测量否掉：softmax 的 Jacobian 谱范数随通道数**上升**
+> （$d{=}16 \to 512$：0.29 → 0.36），不随深度衰减；成对竞争是 0.46 → 0.47，两者同为 $O(1)$。
+> 梯度衰减的真实原因是当时谱半径符号设反与缺少残差，二者已分别修正（§4 / §5）。
+> 成对竞争门控保留，但理由改为工程取舍，不再是"修复梯度死绝"。
+> 数据见 experiments/results/_gate_originality_jac.json。
 
 **(d) 非线性支路.** 只服务于输出，不进入状态递推，因此不破坏扫描的线性性：
 
@@ -202,9 +205,43 @@ $S$ 形状 $(B, \text{slots}, m)$，$k/q$ 经 L2 归一化后映射到 slots 维
 设计要点：
 
 - **注入项乘 $(1-p)$**：使 $|S_t| \le \max(|S_0|, |v \otimes k|)$ 逐元素恒成立，
-  与主状态同为凸组合。若改成 DeltaNet/RWKV-7 的 rank-1 正交校正
-  $S_t = S_{t-1} - \beta(S_{t-1}k)\otimes k + \beta(v \otimes k)$，召回略高，
-  但必须逐 token 串行，会毁掉 O(N) 并行扫描。
+  与主状态同为凸组合。代价是同一 key 反复写入只能累加、不能覆盖：实测写入 8 个 key 再
+  覆盖其中 4 个，凸组合读回旧值占主导（相对误差 0.75–0.92，随 $p$ 变化），delta 写入
+  读回新值（相对误差 0.06），见 `experiments/_assoc_overwrite.py`。
+- **可选 delta 写入**（`assoc_write='delta'`）：$S_t = p \odot S_{t-1}
+  - \beta k_t(k_t^{\top}S_{t-1}) + \beta (v_t \otimes k_t)$，先从记忆里减去该 key 的旧关联
+  再写入新值，故能精确覆盖。$\beta=\sigma(W_b x)$ 可学。
+  曾认为 delta 必须逐 token 串行、会毁掉 O(N) 并行扫描——这一步是错的：
+  delta 有 WY 分块形式（块内 $S_t = S_{\text{in}} + K_{0:t}^{\top}W_{0:t}$，
+  $W=(I+L)^{-1}\operatorname{diag}(\beta)(V-K S_{\text{in}})$，$L_{ij}=\beta_i(k_i\cdot k_j)$
+  取下三角），已实现为 `ops.chunk_delta_scan`，与逐步 delta 在 fp64 一致到 1e-16
+  （任意 chunk、有/无衰减），见 `experiments/_chunk_delta.py` 与
+  `tests/test_architecture.py::test_chunk_delta_scan_matches_step_fp64`。
+  代价是块内多解一个 $C\times C$ 三角系统。实测反而比软写便宜：软写把外积物化成
+  $(B,T,\text{slots}\cdot m)$ 张量再扫描，`log`/`cumsum`/`exp` 全跑在 $\text{slots}\cdot m$
+  宽上（仅 `cumsum` 一项就占软写的 38%）；delta 把状态留在 $(\text{slots},m)$ 形状，
+  逐元素工作降到窄宽度。训练步 delta/soft 为 0.84–0.89×（slots 32×16）、0.58–0.65×（64×32）、
+  0.51–0.62×（128×64），参数只多一个 `W_b`（+0.034%）。见 §26.7(6)。
+- **衰减归约的方向有讲究**（`assoc_decay`）：分块形式只收标量衰减，逐通道头 `W_g` 的
+  $(B,T,m)$ 输出必须压成 $(B,T)$。压法用 `amin`（取最快遗忘通道）会把块内 $1/\prod d$ 的
+  峰值条件数拉到 **9.92e16**（chunk=64），`amax` 只要 **1.78**；同时 `amin` 只用掉 1/16 的
+  通道输出、剩下 15/16 是死参数。`assoc_decay='scalar'` 用专用 `W_gd(dim→2)` 直接输出
+  （保持率 $p$、写强度 $\beta$），不做归约。$p$ 须走与逐通道头同一条 H 参数化
+  （$p=1-1/H \ge 1-1/h_{\min}$，即 $p \ge 0.5$），否则裸 $\sigma$ 让 $p$ 落到 0.01、训练发散。
+  修后：参数比软写少 7,160（−0.47%），MQAR 种子崩溃消失，ppl/覆盖召回不劣。见 §26.9。
+- **块长 32 由稳定性定，不由速度定**：`scalar` 把 $p$ 锁在 $\ge 0.5$ 后，$d_{\min}^{-L}$ 到
+  $L$=64 才 1.84e19，看似可以放开。速度上却测不出差异——跨进程 22 个读数中位比 32/64 =
+  0.94×、32/128 = 0.91×，而 64 自身极差 34.55 ms 远大于 3.8 ms 的中位差（单进程内测块长
+  排名会给出假差异）。稳定性是硬结论：$p$=0.5 时 $L$=64 的衰减梯度已非有限，$L$=128
+  前向即 NaN。故 `cap=32` 由稳定性决定，速度不劣只是附带。
+  守卫的 headroom 原取 $2^{80}$，比实测安全水位（$2^{57}$–$2^{62}$）宽 30 位，对 $p$=0.1/0.2
+  给出的块长实际不稳定，已改为 $2^{50}$；生产路径 $p\ge 0.5$ 时块长不受影响。见 §26.9(7)(8)。
+- **写 key 取自上一位置**（`assoc_shift`）：写操作要表达的是 (key → value) 关联，
+  而识别到 key 的那一刻还没见过 value。k/v/q 若全部取自当前位置，只能表达 token → token
+  记忆，结构上写不进 (key → value)——这正是早期召回实验两个写规则都停在随机水平
+  （0.02 vs 1/32≈0.031）的根因。开启后 k 取自上一位置（位置 0 用卷积历史里最近一条），
+  延迟写入不引入额外状态。`forward` 与 `step` 在四种写规则 × 两种 shift 下一致到 1e-6
+  （`tests/test_architecture.py::test_assoc_shift_forward_step_matches_fp64`）。
 - **复用一个扫描原语**：$S$ 的递推与主状态同构（一阶线性凸组合），
   直接调用 `logspace_scan`，分块并行、单步-整段一致性、有界性全部继承。
 - **宽度与 $d$ 解耦**：若按逐 head 全宽取 $H m^2 = d^2/H$，实测训练步倍数随
@@ -436,7 +473,7 @@ BPE 子词分词器，从零实现（`sunnynet/tokenizer.py`），不依赖 `tok
 
 实测往返一致性：中文古文、英文文学、Python 代码、中英混排 **6/6 全部无损**。
 
-> 输入层不属于原创网络核心单元，其存在不违反架构原创性要求。
+> 输入层沿用通用 BPE 分词，不属于网络核心单元。
 
 ---
 

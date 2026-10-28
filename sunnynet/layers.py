@@ -13,7 +13,7 @@ import torch.nn.functional as F
 
 from .init import orthogonal_spectrum_
 from .kernels.core_auto import core_forward, dw_step, kernel_active, step_core
-from .ops import CenteredScaleNorm, horizon_logit, logspace_scan
+from .ops import CenteredScaleNorm, chunk_delta_scan, horizon_logit, logspace_scan
 
 __all__ = ["StateCirculant", "DepthwiseCausal", "AssocMemory", "SunnyBlock",
            "SunnyState"]
@@ -91,37 +91,52 @@ def _pick_group(dim: int, requested: int) -> int:
 
 
 class AssocMemory(nn.Module):
-    """固定宽度的矩阵值关联记忆: S (B,H,slots,m), 凸组合递推, 读出 o = S^T q.
+    """固定宽度矩阵值关联记忆: S (B,slots,m), 读出 o = S^T q.
 
-    形状是关键决策. 逐 head 全宽 (H*m*m = D^2/H) 会随模型维度平方增长 ——
-    实测 dim 64/128/256 的训练步倍数 6.9x/8.7x/16.5x, 在生产宽度直接毁掉
-    CPU 速度. 因此这里用**固定的** slots × m 预算, 与 dim 解耦:
-    容量随 dim 不变, 成本随 dim 不变, 只额外提供一块专用关联记忆.
-
-        S_t = p ⊙ S_{t-1} + (1-p) ⊙ (v_t ⊗ k_t),    o_t = W_o(S_t^T q_t)
-
-    凸组合 (注入乘 1-p) 使 |S| <= max(|S_0|, |v⊗k|) 恒成立, 且能整段分块扫描;
-    逐 token 串行的 delta rule 会毁掉 O(N) 并行优势.
-
-    slots 是 key 侧维度 (记忆槽数), m 是 value 侧维度 (每槽存多少分量);
-    读写投影把 dim 映射到这对固定宽度.
+    写规则 (write_rule): "soft" 为凸组合 S_t = p⊙S_{t-1} + (1-p)⊙(v_t⊗k_t);
+    "delta" 为 S_t = p⊙S_{t-1} - β k_t(k_tᵀS_{t-1}) + β(v_t⊗k_t), 减去该 key 旧关联再写,
+    故能覆盖同一 key (相对误差 0.06, 软写 0.75-0.92). delta 走 ops.chunk_delta_scan 分块形式.
+    slots 为 key 侧槽数, m 为 value 侧每槽分量数, 两者固定, 与 dim 解耦.
     """
 
     def __init__(self, dim: int, slots: int = 128, m: int = 64,
-                 h_min: float = 2.0, h_max: float = 8192.0, generator=None):
+                 h_min: float = 2.0, h_max: float = 8192.0, generator=None,
+                 write_rule: str = "soft", beta_init: float = 0.5,
+                 decay_mode: str = "reduce"):
         super().__init__()
         self.dim = dim
         self.slots = slots
         self.m = m
+        self.write_rule = write_rule
+        # 分块 delta 只收标量衰减: reduce 归约逐通道头, scalar 用专用标量头直接输出.
+        self.decay_mode = decay_mode
+        self.use_scalar_decay = (write_rule == "delta" and decay_mode == "scalar")
         self.W_k = nn.Linear(dim, slots, bias=False)
         self.W_v = nn.Linear(dim, m, bias=False)
         self.W_q = nn.Linear(dim, slots, bias=False)
         self.W_o = nn.Linear(m, dim, bias=False)
-        self.W_g = nn.Linear(dim, m, bias=False)
+        self.W_g = None if self.use_scalar_decay else nn.Linear(dim, m, bias=False)
+        # (保持率, 写强度) 两个标量: 无需归约, 参数远少于逐通道头.
+        self.W_gd = nn.Linear(dim, 2, bias=True) if self.use_scalar_decay else None
+        self.W_b = (nn.Linear(dim, 1, bias=True)
+                    if (write_rule == "delta" and not self.use_scalar_decay) else None)
         self.norm = CenteredScaleNorm(dim)
         self.h_min, self.h_max = h_min, h_max
         self.register_buffer("delta_min", torch.tensor(1.0 / h_max), persistent=True)
-        nn.init.zeros_(self.W_g.weight)
+        if self.W_g is not None:
+            nn.init.zeros_(self.W_g.weight)
+        if self.W_b is not None:
+            nn.init.zeros_(self.W_b.weight)
+            nn.init.constant_(self.W_b.bias, math.log(beta_init / (1.0 - beta_init)))
+        if self.W_gd is not None:
+            nn.init.zeros_(self.W_gd.weight)
+            # 与逐通道头零初始化等价: H = sqrt(h_min*h_max), delta = 1/H 落在对数刻度中点.
+            lo, hi = 1.0 / h_max, 1.0 / h_min
+            d0 = 1.0 / (h_min * math.sqrt(h_max / h_min))
+            mid = min(max((d0 - lo) / (hi - lo), 1e-6), 1.0 - 1e-6)
+            with torch.no_grad():
+                self.W_gd.bias[0] = math.log(mid / (1.0 - mid))
+                self.W_gd.bias[1] = math.log(beta_init / (1.0 - beta_init))
         for w in (self.W_k, self.W_v, self.W_q, self.W_o):
             orthogonal_spectrum_(w.weight, 0.7, generator)
 
@@ -132,17 +147,53 @@ class AssocMemory(nn.Module):
         H = self.h_min * torch.exp(span * torch.sigmoid(g))
         return 1.0 / H
 
-    def _kvq(self, x: torch.Tensor):
-        k = torch.nn.functional.normalize(self.W_k(x), dim=-1)     # (B,T,slots)
+    def beta(self, x: torch.Tensor) -> torch.Tensor:
+        """delta 写入强度 β = sigmoid(W_b x) (B,T), 每 token 一个标量."""
+        return torch.sigmoid(self.W_b(x)).squeeze(-1)
+
+    def keep_beta(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """scalar 模式: 一次线性给 (保持率 p, 写强度 β), 均为 (B,T).
+
+        p 走与逐通道头同一条 H 参数化 (delta = 1/H, H ∈ [h_min, h_max]), 否则裸 sigmoid
+        让 p 能落到 0.01, 块内 1/∏p 爆量后训练发散.
+        """
+        ab = self.W_gd(x)
+        s = torch.sigmoid(ab[..., 0])
+        d = 1.0 / self.h_max + (1.0 / self.h_min - 1.0 / self.h_max) * s
+        return 1.0 - d, torch.sigmoid(ab[..., 1])
+
+    def keep(self, x: torch.Tensor) -> torch.Tensor:
+        """标量保持率 p (B,T). 归约取组内最小保持率——见 _safe_chunk_delta 的上限约束."""
+        if self.use_scalar_decay:
+            return self.keep_beta(x)[0]
+        return (1.0 - self.delta(x)).amin(dim=-1)
+
+    def _kvq(self, x: torch.Tensor, kx: torch.Tensor | None = None):
+        k = torch.nn.functional.normalize(self.W_k(kx if kx is not None else x), dim=-1)
         v = self.W_v(x)                                            # (B,T,m)
         q = torch.nn.functional.normalize(self.W_q(x), dim=-1)     # (B,T,slots)
         return k, v, q
 
-    def forward(self, x: torch.Tensor, mem: torch.Tensor, chunk: int = 64):
-        """x (B,T,D) + mem (B,slots,m) -> (out (B,T,D), mem_T (B,slots,m))."""
+    def forward(self, x: torch.Tensor, mem: torch.Tensor, chunk: int = 64,
+                kx: torch.Tensor | None = None):
+        """x (B,T,D) + mem (B,slots,m) -> (out (B,T,D), mem_T (B,slots,m)).
+
+        kx 给定时, 写 key 取自 kx (上一位置), value/query 仍取自 x.
+        """
         B, T, D = x.shape
         S0, M = self.slots, self.m
-        k, v, q = self._kvq(x)
+        k, v, q = self._kvq(x, kx)
+        if self.write_rule == "delta":
+            if self.use_scalar_decay:
+                p, beta = self.keep_beta(x)                           # (B,T) 各自标量
+            else:
+                d = 1.0 - self.delta(x)                               # (B,T,m) 逐通道保持率
+                p = d.amin(dim=-1)                                    # 归约成标量 (分块形式只收标量)
+                beta = self.beta(x)                                   # (B,T)
+            S, mem_T = chunk_delta_scan(k, v, beta, mem, decay=p, chunk=chunk,
+                                        p_min=float(p.detach().amin()))
+            o = torch.einsum("btsm,bts->btm", S, q)
+            return self.norm(self.W_o(o)), mem_T
         inj = (v.unsqueeze(-2) * k.unsqueeze(-1)).reshape(B, T, S0 * M)   # (B,T,S0,m)
         p = 1.0 - self.delta(x)                                          # (B,T,m)
         p_full = p.unsqueeze(-2).expand(B, T, S0, M).reshape(B, T, S0 * M)
@@ -152,15 +203,32 @@ class AssocMemory(nn.Module):
         o = torch.einsum("btsm,bts->btm", S, q)
         return self.norm(self.W_o(o)), mem_T.reshape(B, S0, M)
 
-    def step(self, x_t: torch.Tensor, mem: torch.Tensor):
-        """x_t (B,D) + mem (B,slots,m) -> (out (B,D), mem_new (B,slots,m))."""
+    def step(self, x_t: torch.Tensor, mem: torch.Tensor,
+             kx_t: torch.Tensor | None = None):
+        """x_t (B,D) + mem (B,slots,m) -> (out (B,D), mem_new (B,slots,m)).
+
+        kx_t 给定时写 key 取自它 (上一位置的输入).
+        """
         S0, M = self.slots, self.m
         B = x_t.shape[0]
-        k, v, q = self._kvq(x_t[:, None, :])
+        k, v, q = self._kvq(x_t[:, None, :],
+                            None if kx_t is None else kx_t[:, None, :])
         k, v, q = k[:, 0], v[:, 0], q[:, 0]                       # (B,S0),(B,m),(B,S0)
-        p = 1.0 - self.delta(x_t[:, None, :])[:, 0]               # (B,m)
         inj = v.unsqueeze(-2) * k.unsqueeze(-1)                   # (B,S0,m)
-        mem_new = p.unsqueeze(-2) * mem + (1.0 - p).unsqueeze(-2) * inj
+        if self.write_rule == "delta":
+            if self.use_scalar_decay:
+                p, beta = self.keep_beta(x_t)
+                p, beta = p[:, None], beta[:, None]                   # (B,1)
+            else:
+                p = (1.0 - self.delta(x_t[:, None, :])[:, 0]).amin(dim=-1, keepdim=True)
+                beta = self.beta(x_t)[:, None]
+            mem_new = p.unsqueeze(-1) * mem
+            pred = torch.einsum("bs,bsm->bm", k, mem_new)         # (B,m)
+            mem_new = mem_new - beta.unsqueeze(-1) * k.unsqueeze(-1) * pred.unsqueeze(-2) \
+                + beta.unsqueeze(-1) * inj
+        else:
+            p = 1.0 - self.delta(x_t[:, None, :])[:, 0]           # (B,m)
+            mem_new = p.unsqueeze(-2) * mem + (1.0 - p).unsqueeze(-2) * inj
         o = torch.einsum("bsm,bs->bm", mem_new, q)
         return self.norm(self.W_o(o)), mem_new
 
@@ -193,6 +261,8 @@ class SunnyBlock(nn.Module):
         self.use_assoc = (bool(ab.get("assoc", False))
                           and (self.assoc_every <= 0
                                or layer_index % max(1, self.assoc_every) == 0))
+        # 写 key 取自上一位置; 不延迟则只能表达 token→token, 写不进 (key→value) 关联.
+        self.assoc_shift = bool(ab.get("assoc_shift", False))
 
         self.norm_in = CenteredScaleNorm(dim)
         self.norm_mix = CenteredScaleNorm(inner)
@@ -206,7 +276,9 @@ class SunnyBlock(nn.Module):
         self.W_c = nn.Linear(inner, dim, bias=False)
         self.W_s = nn.Linear(dim, dim, bias=False)
         self.assoc = (AssocMemory(dim, self.assoc_slots, self.assoc_m,
-                                  h_min=h_min, h_max=h_max, generator=generator)
+                                  h_min=h_min, h_max=h_max, generator=generator,
+                                  write_rule=str(ab.get("assoc_write", "soft")),
+                                  decay_mode=str(ab.get("assoc_decay", "reduce")))
                       if self.use_assoc else None)
         self.W_a = nn.Linear(dim, dim, bias=False) if self.use_assoc else None
         if self.W_a is not None:
@@ -387,7 +459,14 @@ class SunnyBlock(nn.Module):
             out = out + x
         if self.assoc is None:
             return out, states[:, -1], hist_new
-        aout, mem_T = self.assoc(a, mem, chunk=self.scan_chunk)
+        if self.assoc is None:
+            return out, states[:, -1], hist_new
+        kx = None
+        if self.assoc_shift:
+            # 上一位置的输入, 与单步的 hist[:,0] 同源 (raw 而非卷积后).
+            # forward 的 hist 时间升序, 最近一条在末位; 位置 0 无前置就借它.
+            kx = torch.cat([hist[:, -1:], raw[:, :-1]], dim=1) if T > 1 else hist[:, -1:]
+        aout, mem_T = self.assoc(a, mem, chunk=self.scan_chunk, kx=kx)
         return out + self.W_a(aout), states[:, -1], hist_new, mem_T
 
     def step(self, x_t: torch.Tensor, s: torch.Tensor, hist: torch.Tensor,
@@ -436,5 +515,6 @@ class SunnyBlock(nn.Module):
             out = out + x_t
         if self.assoc is None:
             return out, s_new, hist_new
-        aout, mem_new = self.assoc.step(a_t, mem)
+        kx_t = hist[:, 0] if (self.assoc_shift and k > 0) else None
+        aout, mem_new = self.assoc.step(a_t, mem, kx_t)
         return out + self.W_a(aout), s_new, hist_new, mem_new

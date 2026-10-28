@@ -4,6 +4,51 @@
 
 ## 未发布
 
+### 关联记忆：delta 写入、写 key 对齐与数值边界
+- `AssocMemory` 新增 `assoc_write='delta'`：`S_t = p⊙S_{t-1} − β k_t(k_tᵀS_{t-1}) + β(v_t⊗k_t)`，
+  先从记忆减去该 key 的旧关联再写新值，故能精确覆盖同一 key。软写（凸组合）在覆盖召回上
+  读回旧值占主导（相对误差 0.75–0.92），delta 读回新值（0.06）。
+- 分块形式 `ops.chunk_delta_scan`（WY：`W=(I+L)⁻¹diag(β)(V−K S_in)`，L 取下三角），
+  与逐步 delta 在 fp64 一致到 1e-16（任意块长、有/无衰减）。delta rule 与 WY 表示属 DeltaNet / FLA 既有。
+- `_safe_chunk_delta` 限块长 32：fp32 下 chunk=64 训练中反向产出非有限 decay 梯度
+  （anomaly detector 定位到 `AminBackward0`），2/3 种子发散（step 237/249）；限长后 3/3 通过。
+- 写 key 改取自上一位置（`assoc_shift`）：原 k/v/q 同取当前位置只能表达 token→token 记忆，
+  结构上写不进 (key→value)。这是早期召回实验两个写规则都停在随机水平（0.02 vs 1/32）的根因；
+  修正后 MQAR 上 off 0.033 / soft 0.936 / delta 0.961。
+- 训练步耗时实测（`experiments/_assoc_ab_speed.py`，每格独立子进程、多轮交错）：分块 delta 写
+  反而比软写便宜——软写把外积物化成 (B,T,slots·m) 张量再扫描，log/cumsum/exp 全跑在 slots·m 宽上
+  （仅 cumsum 占软写 38%）；delta 把状态留在 (slots,m) 形状、每块只解一个 C×C 三角系统。
+  delta/soft 训练步 0.84–0.89×（32×16）/ 0.58–0.65×（64×32）/ 0.51–0.62×（128×64），
+  参数只多一个 `W_b`（+516，+0.034%）。
+- **`assoc_decay='scalar'`**：分块 delta 只收标量衰减，原先用 `amin` 把逐通道头 `W_g` 的
+  $(B,T,m)$ 压成 $(B,T)$——取的是「遗忘最快的通道」，把块内 $1/\prod d$ 的峰值条件数在
+  chunk=64 下拉到 **9.92e16**（`amax` 只要 1.78），同时只用掉 1/16 的通道输出。
+  改为专用 `W_gd(dim→2)` 直接输出（保持率、写强度），不做归约。$p$ 走与逐通道头同一条 H
+  参数化（$p \ge 1-1/h_{\min} = 0.5$）；裸 $\sigma$ 会让 $p$ 落到 0.01 后发散（实测把崩溃
+  从 seed 7 挪到 seed 2024，已修）。修后参数比软写少 **7,160（−0.47%）**，
+  MQAR 种子崩溃消失（seed 7：0.0141 → 0.9484），覆盖召回与 ppl 不劣，训练步 0.867×、
+  解码 0.955×（5 轮配对 4 胜）。
+- `_safe_chunk_delta` 的块长改由实际衰减反解（$d_{\min}^{-L} \le 2^{50}$）。headroom 原取
+  $2^{80}$，比实测安全水位（$2^{57}$–$2^{62}$）宽 30 位，对 $p$=0.1/0.2 返回 $L$=24/34 实测
+  均产出非有限衰减梯度；改为 $2^{50}$ 后 $p\in[0.05,0.9]$ 全区间稳定。生产路径 $p\ge 0.5$
+  时 by_cond 恒 $\ge 50 > \text{cap}$，块长不变。
+- 块长 32 由稳定性决定，不由速度决定：跨进程 22 个读数下 32/64 中位比 0.94×、32/128 0.91×，
+  而 64 自身极差 34.55 ms 远大于 3.8 ms 的中位差 ⇒ 各块长速度持平、测不出排名（单进程内
+  测块长排名会给出假差异）。稳定性则明确：$p$=0.5 时 $L$=64 已产出非有限衰减梯度，
+  $L$=128 前向即 NaN。`cap=32` 保留。
+- 新增 4 条不变量测试：scalar 衰减的 forward/step 一致、逐通道头不建、块长随衰减收缩。
+- 新增 1 条守卫测试：块长反解须使 $d_{\min}^{-L} \le 2^{50}$，锁住 headroom 回退。
+- 新增 15 条不变量测试：shift 的 forward/step 一致、chunk 不变量、因果性、覆盖、块长上限。
+
+### 门控归因核验与原创性说明
+- `experiments/_gate_originality.py`：算子级 Jacobian 谱范数随 d 上升（softmax 0.32→0.39，无 1/d 衰减），
+  模型级梯度不随深度衰减。原"softmax Jacobian 含 1/d 致梯度死绝"的论证不成立，已订正。
+- 门控形式质量对照（dim=128、4 层、600 步、zh_ancient、3 种子）：pairwise 326.61 / softmax 327.96 /
+  scalar 325.27 / none 369.42。三者之差远小于种子波动与无门控差距，门控有无是关键，形式差异在噪声内。
+- `docs/{cn,en}/ORIGINALITY.md`（新增）：逐组件列出先行工作，标明可声称范围。
+- README / ARCHITECTURE / CHANGELOG 中"非 Transformer / RNN 的原创架构"表述与实测不符，改为
+  线性递推家族成员表述。
+
 ### 训练里程碑 checkpoint + 语料/代码扩充
 - `train/train.py` 新增 `--save-every N`（默认 0 关闭）：每 N 步在
   `--save-ckpt` 旁另存 `<stem>_<step>.pt` 里程碑 checkpoint，便于长跑采样
@@ -197,8 +242,8 @@
 
 首个可用版本。
 
-### 原创架构
-- SunnyNet：CPU 上训练的通用序列架构（非 Transformer / RNN / Mamba / CNN）。
+### 架构
+- SunnyNet：CPU 上训练的一阶线性递推序列架构（线性注意力家族）。
   CenteredScaleNorm、组内成对通道竞争、对数域并行扫描、多尺度衰减。
 - 预设 `proto20mw`（d640/i1280/r384/L6）与 `p100mw`（d1408/i1920/r1024/L8）。
 - 不变量自检（`tests/test_architecture.py`）：fp64 单步 vs 整段、分段续算、分块不变性、因果性。

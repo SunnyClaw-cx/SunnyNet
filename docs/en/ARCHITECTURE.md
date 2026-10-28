@@ -3,10 +3,10 @@
 # SunnyNet Architecture
 
 > This document gives all mathematical definitions and design rationale of SunnyNet.
-> SunnyNet is a standalone original architecture; it is **not based on** any existing neural
-> network paradigm such as Transformer / RNN (LSTM/GRU) / Mamba (SSM) / CNN, and it does not
-> reuse existing schemes such as ReLU/GELU/SiLU, LayerNorm/RMSNorm/InstanceNorm, or
-> Xavier/Glorot/He/MSRA initialization.
+> SunnyNet belongs to the linear-attention / linear-RNN family — its state update is a gated convex
+> combination, and first-order linear recurrence is the shared paradigm of that field since 2020.
+> What is specific here is the form of the activation, normalization, initialization, and gating.
+> A component-by-component comparison against prior work is in [ORIGINALITY.md](ORIGINALITY.md).
 
 ## 0. Design Starting Point
 
@@ -73,14 +73,16 @@ u_t = u^{\text{raw}}_t \odot w_t
 $$
 
 $w_i < 1$ makes $u_t$ bounded, which is the precondition for the subsequent "convex combination" to keep the state from diverging.
-Intra-group competition expresses the same "multiple channels contending for one resource" semantics as softmax, but **the Jacobian magnitude is $O(1)$ rather than $O(1/d)$**.
+It is chosen over softmax for an engineering reason: softmax needs a max-subtract and an exp, while pairwise competition needs two sigmoids. Both express the "multiple channels contending for one resource" semantics.
 
-> **This is a measurement-driven correction**: the first version used $\mathrm{softmax}(g_t)$ for channel
-> competition. Measurements found the gradient norm decaying with depth by a factor of about $0.018$,
-> reaching **exactly zero** after 16 layers — the softmax Jacobian contains a $1/d$ factor, which
-> discounts by one factor per layer over 128 channels, so deep stacking inevitably kills gradients.
-> After switching to intra-group pairwise competition, the $J$ magnitude returns to $O(1)$.
-> Recorded here to document the origin of the design constraint.
+> **A correction, kept on record**: an early design attributed the depth gradient decay to
+> "the softmax Jacobian contains a $1/d$", and switched to pairwise competition on that basis.
+> Measurement later refuted the attribution: the Jacobian spectral norm of softmax **rises** with
+> channel count ($d{=}16 \to 512$: 0.29 → 0.36) and does not decay with depth; pairwise competition is
+> 0.46 → 0.47, both $O(1)$. The real causes of the gradient decay were the inverted spectral-radius
+> sign and the missing residual, both since corrected (§4 / §5). The pairwise competition gate is kept,
+> but for the engineering tradeoff, no longer as a "fix for dying gradients".
+> Data in experiments/results/_gate_originality_jac.json.
 
 **(d) Nonlinear branch.** It serves only the output and does not enter the state recurrence, so it does not break the linearity of the scan:
 
@@ -205,9 +207,50 @@ $S$ has shape $(B, \text{slots}, m)$; $k/q$ are L2-normalized and then mapped to
 Design points:
 
 - **The injected term is multiplied by $(1-p)$**: this makes $|S_t| \le \max(|S_0|, |v \otimes k|)$ hold elementwise at all times,
-  the same convex combination as the main state. Switching to the rank-1 orthogonal correction of DeltaNet/RWKV-7,
-  $S_t = S_{t-1} - \beta(S_{t-1}k)\otimes k + \beta(v \otimes k)$, gives slightly higher recall,
-  but requires per-token serial processing and would destroy the O(N) parallel scan.
+  the same convex combination as the main state. The cost is that writing the same key repeatedly only accumulates and cannot overwrite:
+  writing 8 keys then overwriting 4 of them, the convex combination reads back mostly the old value (relative error 0.75–0.92, depending on $p$),
+  while the delta write reads back the new value (relative error 0.06). See `experiments/_assoc_overwrite.py`.
+- **Optional delta write** (`assoc_write='delta'`): $S_t = p \odot S_{t-1} - \beta k_t(k_t^{\top}S_{t-1}) + \beta (v_t \otimes k_t)$,
+  subtracting the key's old association before writing the new value, so it overwrites exactly. $\beta=\sigma(W_b x)$ is learnable.
+  It was believed delta had to be per-token serial and would destroy the O(N) scan — that step was wrong:
+  delta has a WY chunked form (in-block $S_t = S_{\text{in}} + K_{0:t}^{\top}W_{0:t}$,
+  $W=(I+L)^{-1}\operatorname{diag}(\beta)(V-K S_{\text{in}})$, $L_{ij}=\beta_i(k_i\cdot k_j)$, lower triangular),
+  implemented as `ops.chunk_delta_scan`, matching the sequential delta to 1e-16 in fp64 (any chunk size, with or without decay);
+  see `experiments/_chunk_delta.py` and `tests/test_architecture.py::test_chunk_delta_scan_matches_step_fp64`.
+  The cost is one extra $C\times C$ triangular solve per block. In practice it is cheaper than the
+  soft write: soft materializes the outer product into a $(B,T,\text{slots}\cdot m)$ tensor and scans
+  it, so `log`/`cumsum`/`exp` all run at width $\text{slots}\cdot m$ (`cumsum` alone is 38% of soft's
+  time); delta keeps the state at $(\text{slots},m)$ and drops the elementwise work to narrow widths.
+  The training step is 0.84–0.89× (slots 32×16), 0.58–0.65× (64×32) and 0.51–0.62× (128×64) of soft,
+  at a parameter cost of one `W_b` (+0.034%). See §26.7(6).
+- **The direction of the decay reduction matters** (`assoc_decay`): the chunked form only accepts a
+  scalar decay, so the per-channel head `W_g`'s $(B,T,m)$ output must be collapsed to $(B,T)$.
+  Collapsing with `amin` (fastest-forgetting channel) drives the block's peak $1/\prod d$ condition
+  number to **9.92e16** at chunk=64, against **1.78** for `amax`; `amin` also keeps only 1 of 16
+  channels and leaves the other 15/16 as dead parameters. `assoc_decay='scalar'` instead outputs
+  (keep-rate $p$, write strength $\beta$) directly from a dedicated `W_gd(dim→2)` with no reduction.
+  $p$ must follow the same H parameterization as the per-channel head ($p=1-1/H \ge 1-1/h_{\min}$,
+  i.e. $p \ge 0.5$); a bare $\sigma$ lets $p$ fall to 0.01 and the run diverges. After the fix:
+  7,160 fewer parameters than the soft write (−0.47%), the MQAR seed collapse is gone, and neither
+  ppl nor overwrite recall regresses. See §26.9.
+- **A block length of 32 is set by stability, not by speed**: once `scalar` pins $p \ge 0.5$,
+  $d_{\min}^{-L}$ only reaches 1.84e19 at $L$=64, which looks like room to enlarge. Speed shows no
+  resolvable difference — across 22 cross-process readings the median ratio is 0.94× for 32/64 and
+  0.91× for 32/128, while 64's own spread (34.55 ms) dwarfs the 3.8 ms median gap (ranking block lengths
+  inside one process yields false differences). Stability is the hard result: at $p$=0.5 the length-64
+  block already yields non-finite decay gradients, and $L$=128 is NaN in the forward pass. So `cap=32`
+  is set by stability; being no slower is incidental. The guard's headroom was $2^{80}$, 30 bits wider
+  than the measured safety level ($2^{57}$–$2^{62}$), and returned unstable lengths for $p$=0.1/0.2;
+  it is now $2^{50}$. On the production path ($p \ge 0.5$) the block length is unaffected.
+  See §26.9(7)(8).
+- **The write key comes from the previous position** (`assoc_shift`): the write is meant to express a
+  (key → value) association, but at the moment the key is recognized the value has not been seen yet.
+  If k/v/q are all taken from the current position, the memory can only express token → token
+  associations and structurally cannot store (key → value) — which is exactly why early recall
+  experiments left both write rules at chance (0.02 vs. 1/32 ≈ 0.031). When enabled, k is taken from
+  the previous position (position 0 uses the most recent entry in the conv history), and the delayed
+  write adds no extra state. `forward` and `step` agree to 1e-6 across four write rules × two shift
+  settings (`tests/test_architecture.py::test_assoc_shift_forward_step_matches_fp64`).
 - **Reuse one scan primitive**: the recurrence for $S$ is isomorphic to the main state (first-order linear convex combination),
   so it calls `logspace_scan` directly and inherits chunked parallelism, single-step vs. whole-segment consistency, and boundedness.
 - **Width decoupled from $d$**: taking the full per-head width $H m^2 = d^2/H$ makes the measured training-step multiplier grow
@@ -442,7 +485,7 @@ A BPE subword tokenizer implemented from scratch (`sunnynet/tokenizer.py`), with
 
 Measured round-trip consistency: classical Chinese, English literature, Python code, and mixed Chinese-English **6/6 all lossless**.
 
-> The input layer is not part of the original network core unit, and its presence does not violate the architecture's originality requirement.
+> The input layer uses standard BPE tokenization and is not a core unit of the network.
 
 ---
 

@@ -528,6 +528,245 @@ def test_assoc_gradients_finite():
     assert m.num_params(non_embedding=True) == total - m.embed.weight.numel()
 
 
+# ---------------------------------------------------------------- delta 写入
+DELTA = dict(ASSOC, assoc_write="delta")
+SHIFT = dict(ASSOC, assoc_shift=True)
+
+
+@pytest.mark.parametrize("rule", ["soft", "delta"])
+def test_assoc_shift_forward_step_matches_fp64(rule):
+    """写 key 取自上一位置时, 单步与整段仍须 fp64 严格一致."""
+    torch.manual_seed(67)
+    cfg = SunnyConfig(vocab_size=512, dim=64, inner=96, rank=32, layers=2,
+                      ablation=dict(SHIFT, assoc_write=rule))
+    m = SunnyNet(cfg).double().eval()
+    idx = torch.randint(0, 512, (1, 64))
+    with torch.no_grad():
+        full, _ = m(idx, return_state=True)
+        st = m.init_state(1, dtype=torch.float64)
+        outs = []
+        for t in range(idx.shape[1]):
+            lg, st = m.forward_step(idx[:, t], st)
+            outs.append(lg)
+        step = torch.stack(outs, dim=1)
+    d = float((step - full).abs().max())
+    assert d < 1e-10, f"shift 单步与整段不一致 ({rule}) max diff={d}"
+
+
+def test_assoc_shift_causal_no_future_leak():
+    """延迟写 key 引的是过去位置, 因果性不得破坏."""
+    torch.manual_seed(68)
+    cfg = SunnyConfig(vocab_size=512, dim=64, inner=96, rank=32, layers=2,
+                      ablation=dict(SHIFT))
+    m = SunnyNet(cfg).eval()
+    idx = torch.randint(0, 512, (1, 128))
+    k = 64
+    idx2 = idx.clone()
+    idx2[0, k:] = torch.randint(0, 512, (128 - k,))
+    with torch.no_grad():
+        o1 = m(idx)
+        o2 = m(idx2)
+    assert torch.allclose(o1[:, :k], o2[:, :k], atol=1e-6), "shift 破坏因果性"
+
+
+def test_assoc_shift_chunk_invariance():
+    """写 key 延迟后, 分块不变性仍成立."""
+    torch.manual_seed(69)
+    cfg = SunnyConfig(vocab_size=256, dim=64, inner=96, rank=32, layers=2,
+                      ablation=dict(SHIFT))
+    m = SunnyNet(cfg).eval()
+    idx = torch.randint(0, 256, (2, 130))
+    with torch.no_grad():
+        a = m(idx)
+    for blk in m.blocks:
+        blk.scan_chunk = 13
+    with torch.no_grad():
+        b = m(idx)
+    assert float((a - b).abs().max()) < 1e-5, "shift 分块一致性失败"
+
+
+def test_chunk_delta_scan_matches_step_fp64():
+    """分块 delta 写入与逐步递推在 fp64 逐元素一致 (任意 chunk, 有/无衰减)."""
+    from sunnynet.ops import chunk_delta_scan
+    torch.manual_seed(70)
+    B, T, S, M = 2, 40, 24, 12
+    k = torch.randn(B, T, S, dtype=torch.float64)
+    k = k / k.norm(dim=-1, keepdim=True)
+    v = torch.randn(B, T, M, dtype=torch.float64) * 0.3
+    beta = torch.rand(B, T, dtype=torch.float64) * 0.9 + 0.05
+    s0 = torch.randn(B, S, M, dtype=torch.float64) * 0.1
+    decay = torch.rand(B, T, dtype=torch.float64) * 0.2 + 0.79
+
+    def seq(dec):
+        s = s0.clone()
+        outs = []
+        for t in range(T):
+            if dec is not None:
+                s = s * dec[:, t].view(B, 1, 1)
+            pred = torch.einsum("bs,bsm->bm", k[:, t], s)
+            s = s - beta[:, t].view(B, 1, 1) * k[:, t].unsqueeze(-1) * pred.unsqueeze(-2) \
+                + beta[:, t].view(B, 1, 1) * k[:, t].unsqueeze(-1) * v[:, t].unsqueeze(-2)
+            outs.append(s.clone())
+        return torch.stack(outs, dim=1)
+
+    for dec in (None, decay):
+        ref = seq(dec)
+        for chunk in (1, 8, 40, 64):
+            got, sT = chunk_delta_scan(k, v, beta, s0, dec, chunk=chunk)
+            d = float((got - ref).abs().max())
+            de = float((sT - ref[:, -1]).abs().max())
+            assert d < 1e-10, f"chunk={chunk} decay={dec is not None} 不一致 {d}"
+            assert de < 1e-10, f"chunk={chunk} 末态不一致 {de}"
+
+
+def test_delta_chunk_capped():
+    """delta 分块须限块长: 块内 1/∏d 的量级 ~ d_min^-L, 不设限则反向出非有限梯度.
+    按衰减反解块长, 宁可短不可长."""
+    from sunnynet.ops import _safe_chunk_delta
+    assert _safe_chunk_delta(64) <= 32
+    assert _safe_chunk_delta(16) == 16
+    assert _safe_chunk_delta(1) == 1
+    # 衰减越小块长越短, 衰减接近 1 时放开到上限
+    assert _safe_chunk_delta(64, p_min=0.1) < _safe_chunk_delta(64, p_min=0.99)
+    assert _safe_chunk_delta(64, p_min=0.999999) == 32
+    assert _safe_chunk_delta(64, p_min=float("nan")) == 32
+
+
+def test_delta_chunk_guard_stays_under_overflow():
+    """守卫给出的块长必须让 1/∏d 落在实测安全水位之下 (p^-L <= 2^50).
+
+    历史缺陷: headroom 曾取 2^80, 对 p=0.1/0.2 返回 L=24/34, 实测反向非有限.
+    """
+    from sunnynet.ops import _safe_chunk_delta
+    for p_min in (0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.9):
+        # cap 放开, 单独检验 p_min 反解那一条
+        n = _safe_chunk_delta(1000, cap=1000, p_min=p_min)
+        assert p_min ** -n <= 2.0 ** 50, f"p={p_min} 给 L={n}: 1/cumprod={p_min**-n:.2e} 超过 2^50"
+
+
+def test_delta_scalar_decay_forward_step_fp64():
+    """标量衰减头 (decay_mode=scalar) 的 forward 与 step 须 fp64 严格一致."""
+    torch.manual_seed(71)
+    cfg = SunnyConfig(vocab_size=512, dim=64, inner=96, rank=32, layers=2,
+                      ablation=dict(SHIFT, assoc_write="delta", assoc_decay="scalar"))
+    m = SunnyNet(cfg).double().eval()
+    idx = torch.randint(0, 512, (1, 64))
+    with torch.no_grad():
+        full, _ = m(idx, return_state=True)
+        st = m.init_state(1, dtype=torch.float64)
+        outs = []
+        for t in range(idx.shape[1]):
+            lg, st = m.forward_step(idx[:, t], st)
+            outs.append(lg)
+        step = torch.stack(outs, dim=1)
+    d = float((step - full).abs().max())
+    assert d < 1e-10, f"scalar 衰减单步与整段不一致 max diff={d}"
+
+
+def test_delta_scalar_decay_drops_channel_head():
+    """scalar 模式不建逐通道衰减头, 参数少于归约模式."""
+    from sunnynet.layers import AssocMemory
+    red = AssocMemory(128, 32, 16, write_rule="delta", decay_mode="reduce")
+    sca = AssocMemory(128, 32, 16, write_rule="delta", decay_mode="scalar")
+    assert sca.W_g is None and sca.W_gd is not None
+    assert sum(p.numel() for p in sca.parameters()) \
+        < sum(p.numel() for p in red.parameters())
+
+
+def test_delta_decay_conditioning():
+    """归约取最小保持率是唯一能通过块长上限的选择: 保持率越大条件数越小.
+    逐通道 (B,T,m) 压成标量时取 amin —— 块内 1/∏d 量级由 d_min 定."""
+    from sunnynet.layers import AssocMemory
+    torch.manual_seed(72)
+    mod = AssocMemory(128, 32, 16, write_rule="delta", decay_mode="reduce")
+    with torch.no_grad():
+        mod.W_g.weight.normal_(0, 0.5)
+    x = torch.randn(4, 64, 128)
+    d = 1.0 - mod.delta(x)                       # 逐通道保持率
+    p_min = d.amin(-1)
+    assert float(p_min.min()) >= float(d.min()) - 1e-6
+    assert float(p_min.max()) <= float(d.max()) + 1e-6
+
+
+def test_delta_write_overwrites_key():
+    """delta 写入能覆盖同一 key 的旧值; 软凸组合不能."""
+    from sunnynet.ops import chunk_delta_scan
+    torch.manual_seed(71)
+    S, M = 64, 8
+    k = torch.randn(S, dtype=torch.float64)
+    k = k / k.norm()
+    kt = k.view(1, 1, S)                                  # (B=1, T=1, S)
+    v_old = torch.randn(1, 1, M, dtype=torch.float64)
+    v_new = torch.randn(1, 1, M, dtype=torch.float64)
+    beta = torch.ones(1, 1, dtype=torch.float64)
+    zero = torch.zeros(1, S, M, dtype=torch.float64)
+    # 写入 old, 再以 beta=1 覆盖为 new
+    _, s1 = chunk_delta_scan(kt, v_old, beta, zero, None, chunk=1)
+    _, s2 = chunk_delta_scan(kt, v_new, beta, s1, None, chunk=1)
+    read = (k @ s2[0])                                    # 读回
+    rel = float((read - v_new[0, 0]).norm() / v_new[0, 0].norm())
+    assert rel < 0.05, f"delta 未能覆盖 key, 相对误差 {rel}"
+
+
+def test_delta_forward_step_matches_forward_fp64():
+    """delta 写规则下, 单步自回归与整段前向仍须 fp64 一致."""
+    torch.manual_seed(72)
+    cfg = SunnyConfig(vocab_size=512, dim=64, inner=96, rank=32, layers=2,
+                      ablation=dict(DELTA))
+    m = SunnyNet(cfg).double().eval()
+    idx = torch.randint(0, 512, (1, 48))
+    with torch.no_grad():
+        full, _ = m(idx, return_state=True)
+        st = m.init_state(1, dtype=torch.float64)
+        outs = []
+        for t in range(idx.shape[1]):
+            lg, st = m.forward_step(idx[:, t], st)
+            outs.append(lg)
+        step = torch.stack(outs, dim=1)
+    d = float((step - full).abs().max())
+    assert d < 1e-10, f"delta 单步与整段不一致 max diff={d}"
+
+
+def test_delta_chunk_invariance_and_causal():
+    """delta 写规则下分块不变性与因果性."""
+    torch.manual_seed(73)
+    cfg = SunnyConfig(vocab_size=256, dim=64, inner=96, rank=32, layers=2,
+                      ablation=dict(DELTA))
+    m = SunnyNet(cfg).eval()
+    idx = torch.randint(0, 256, (2, 130))
+    with torch.no_grad():
+        a = m(idx)
+    for blk in m.blocks:
+        if blk.assoc is not None:
+            blk.scan_chunk = 1
+    with torch.no_grad():
+        b = m(idx)
+    assert float((a - b).abs().max()) < 1e-5, "delta 分块一致性失败"
+    k = 64
+    idx2 = idx.clone()
+    idx2[0, k:] = torch.randint(0, 256, (130 - k,))
+    with torch.no_grad():
+        o1 = m(idx)
+        o2 = m(idx2)
+    assert torch.allclose(o1[:, :k], o2[:, :k], atol=1e-6), "delta 破坏因果性"
+
+
+def test_delta_gradients_finite():
+    """delta 写规则下 W_b / W_k 梯度有限且非零."""
+    torch.manual_seed(74)
+    cfg = SunnyConfig(vocab_size=512, dim=64, inner=96, rank=32, layers=3,
+                      ablation=dict(DELTA))
+    m = SunnyNet(cfg)
+    idx = torch.randint(0, 512, (2, 128))
+    loss = torch.nn.functional.cross_entropy(m(idx).reshape(-1, 512), idx.reshape(-1))
+    loss.backward()
+    assert m.blocks[0].assoc.W_b is not None
+    for name in ("W_k", "W_b"):
+        p = getattr(m.blocks[0].assoc, name).weight
+        assert p.grad is not None and torch.isfinite(p.grad).all()
+        assert p.grad.abs().max() > 1e-12, f"delta {name} 梯度消失"
+
+
 def test_baseline_param_matching():
     sunny = SunnyNet(SunnyConfig.small(1024))
     target = sunny.num_params(non_embedding=True)

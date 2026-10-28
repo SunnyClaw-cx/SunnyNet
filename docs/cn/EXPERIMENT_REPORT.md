@@ -3241,6 +3241,57 @@ Linux 下是 `sunnynet_runtime.so`，故 `man["sunnynet_runtime.dll"]` 直接 `K
 提供 `_link_cmd` 与 `DLL`，以及反向覆盖（每个 `*_c.py` 都在 `MODULES` 里）。
 用例名一律取自模块属性，跨平台可跑。
 
+### 24.14 通道门控归因核验：原"softmax Jacobian 含 1/d"不成立
+
+设计文档早期把深度梯度衰减归因于"softmax 的 Jacobian 含 $1/d$ 因子，每层打折故深堆叠必死"，
+并据此把通道竞争从 softmax 换成组内成对竞争。本节用算子级与模型级两组测量核验这个归因。
+
+脚本 `experiments/_gate_originality.py jac|grad`，结果 `experiments/results/_gate_originality_{jac,grad}.json`。
+
+**(1) 算子级 Jacobian 谱范数**（fp64，`torch.autograd.functional.jacobian`，`||J||₂`）：
+
+| d | pairwise | softmax | scalar | none |
+|---|---|---|---|---|
+| 16 | 0.44 | 0.32 | 0.25 | 0 |
+| 64 | 0.46 | 0.35 | 0.25 | 0 |
+| 128 | 0.48 | 0.31 | 0.25 | 0 |
+| 256 | 0.48 | 0.35 | 0.25 | 0 |
+| 512 | 0.48 | 0.39 | 0.25 | 0 |
+
+softmax 的 Jacobian 谱范数**随 d 上升**（0.32→0.39），并无 1/d 衰减；其中位数约 0.35 而非 0。
+成对竞争 0.44→0.48，也是 O(1)。两者没有量级差，原论证不成立。
+
+**(2) 模型级嵌入梯度范数**（dim=128，2/4/8/16 层，1 次前反向）：
+
+| 门控 | L2 | L4 | L8 | L16 |
+|---|---|---|---|---|
+| pairwise | 1.08 | 1.11 | 1.19 | 1.26 |
+| softmax | 1.07 | 1.10 | 1.16 | 1.22 |
+| scalar | 1.03 | 1.03 | 1.04 | 1.07 |
+
+梯度不随深度衰减（16 层仍略高于 2 层），pairwise 与 softmax 差 ~3%，在量级内。
+原"0.018 倍衰减、16 层精确归零"与本次测量不符。
+
+**结论**：深度梯度衰减的真因是当时谱半径符号设反（§4）与缺少残差（§5），两者已各自修正。
+成对竞争门控保留，理由改为工程取舍（两次 sigmoid 对 softmax 的减最大值 + 指数，少一次规约），
+不再是"修复梯度死绝"。README 中英 §原创性说明、ARCHITECTURE 中英 §1(c) 已同步订正。
+
+**(3) 门控形式的质量对照**：同一 harness（dim=128、4 层、600 步、lr 3e-3、zh_ancient、3 种子）
+换四种门控测 val ppl：
+
+| 门控 | seed 1234 | seed 7 | seed 2024 | 均值 |
+|---|---|---|---|---|
+| pairwise（现用） | 332.11 | 329.67 | 318.06 | 326.61 |
+| softmax（原设计） | 331.37 | 321.75 | 330.77 | 327.96 |
+| scalar sigmoid | 326.37 | 318.43 | 331.02 | 325.27 |
+| none（无门控） | 362.43 | 371.98 | 373.87 | 369.42 |
+
+**结论**：三种门控两两之差（均值极差 2.7）远小于种子间波动（同一门控跨种子极差 11–14）与
+none 的差距（~43）。即：**门控的有无是关键（无门控差 ~43 ppl），三种门控形式之间的质量差异在
+噪声内，不构成 pairwise 优于 softmax/scalar 的证据**。成对竞争门控保留的理由是工程取舍
+（两次 sigmoid，省 softmax 的减最大值 + 指数），不是质量优势。种子数 3 只能作强弱判断，
+不作显著性声明。
+
 ---
 
 ## 25. 100M 规模训练、权重发布与 Agent 生态接入
@@ -3516,7 +3567,103 @@ GPU（GTX 1060 6GB / torch 2.7.1+cu118）上跑（`experiments/_gpu_compare.py`�
 - **CPU 胜 GPU 的唯一已证区间**：B=1 长上下文单序列解码（`CPU_WAY_OUT.md` §4），
   交点 T≈2048，T=8192 时 CPU 快 2.97×。CPU 原生模型的落点在此。
 
-### 26.7 复现
+### 26.7 关联记忆写规则：软写 vs delta 写，与写 key 对齐
+
+`AssocMemory` 的写入有两个可换的开关：**写什么**（软凸组合 / delta 覆盖）与
+**用什么 key 写**（当前位置 / 上一位置）。本节用同一 harness 把两者拆开测。
+
+**(1) 覆盖场景的相对误差**（`experiments/_assoc_overwrite.py`，写 8 个 key 再覆盖其中 4 个）：
+
+| 规则 | 覆盖后的键（相对误差） | 未覆盖的键 |
+|---|---|---|
+| soft（`p`=0.1 / 0.5 / 0.9） | 0.747 / 0.765 / **0.916** | 0.942–1.004 |
+| delta（$β$=1.0） | **0.063** | 0.200 |
+
+软写把注入项乘 $(1-p)$，同一 key 反复写入只能累加，读回的是新旧混合；delta 先从记忆里
+减去该 key 的旧关联再写新值，故能精确覆盖。**这是 delta 写唯一站得住的机制立论点。**
+
+**(2) delta 的分块形式**（`experiments/_chunk_delta.py`）：delta 曾被认为必须逐 token 串行、
+会毁掉 $O(N)$ 并行扫描。该判断有误——delta 有 WY 分块形式
+（块内 $S_t = S_{\text{in}} + K_{0:t}^{\top}W_{0:t}$，
+$W=(I+L)^{-1}\operatorname{diag}(β)(V-K S_{\text{in}})$，$L_{ij}=β_i(k_i\cdot k_j)$ 取下三角），
+已实现为 `ops.chunk_delta_scan`。与逐步 delta 在 **fp64 一致到 1e-16**（任意块长 4/8/16、
+有/无衰减均 $\le 8.9\times10^{-16}$）。代价是块内多解一个 $C\times C$ 三角系统。
+delta rule 与 WY 表示属 DeltaNet / FLA 既有，非本项目发明。
+
+**(3) 写 key 对齐是必要条件**（`experiments/_assoc_ab.py overwrite`，$d$=64、2 层、
+800 步、B32/T64、slots 32×m 16、3 种子）：
+
+| 写 key | 规则 | seed 1234 | seed 7 | seed 2024 |
+|---|---|---|---|---|
+| 当前位置 | soft | 0.036 | 0.078 | 0.034 |
+| **上一位置** | soft | **0.808** | **0.895** | **0.902** |
+| 当前位置 | delta | 0.036 | 0.041 | 0.056 |
+| **上一位置** | delta | **0.919** | **0.933** | **0.920** |
+| — | off（关闭关联记忆） | 0.036 | 0.033 | 0.034 |
+
+随机基线 $1/32=0.031$。**三种子一致**：写 key 取当前位置时两个规则都掉回随机水平
+（0.034–0.078），取上一位置才上去（soft 0.81–0.90，delta 0.92–0.93）。
+机制是结构性的——写操作要表达 (key → value) 关联，而识别到 key 的那一刻还没见过 value；
+k/v/q 若全部取自当前位置，只能表达 token → token 记忆，关联根本写不进。
+`off` 行说明关闭关联记忆时主路径解不了这个任务（$\approx$ 随机），任务足够难。
+**写 key 对齐不是可选优化，是 delta/soft 覆盖写入生效的前提。**
+
+**(4) MQAR 对照**（同 harness、n\_pair=4、3 种子）：
+
+| 规则 | seed 1234 | seed 7 | seed 2024 |
+|---|---|---|---|
+| off | 0.033 | 0.023 | 0.034 |
+| soft | 0.936 | 0.950 | 0.959 |
+| delta | 0.961 | **0.014** | 0.955 |
+
+MQAR 上 soft 与 delta 三种子中两个接近（差 $<1.2\%$），**判别力弱**；但 delta 在
+seed 7 崩到 **0.014（低于随机）** —— 与 §26.7(5) 的发散同源，是 delta 的稳定性代价。
+
+**(5) 真实语料 ppl 与稳定性代价**（`experiments/_assoc_ab.py ppl`，$d$=128、4 层、600 步、
+zh\_ancient、3 种子）：
+
+| 规则 | seed 1234 | seed 7 | seed 2024 | 均值 |
+|---|---|---|---|---|
+| soft | 332.05 | 324.03 | 354.97 | 337.02 |
+| delta | 342.35 | 331.25 | 347.85 | 340.48 |
+
+delta 均值比 soft 高 **3.47（+1.0%）**，但逐种子方向不完全一致（+10.3 / +7.2 / −7.1），
+且远小于组内极差（soft 30.94 / delta 16.60）⇒ **读作略差、在种子噪声内**，不构成质量优势。
+
+delta 的稳定性代价已定位（`ops._safe_chunk_delta`）：fp32 下 chunk=64 训练中反向产出
+**非有限 decay 梯度**（`torch.autograd` anomaly detector 报 `AminBackward0`——`amin` 反向把
+inf 乘到非 argmin 位置得 nan），2/3 种子发散（step 237 / 249）；块长降到 $\le 32$ 后 3/3 通过；
+fp64 全程稳定。分块形式本身与逐步等价到 1e-16，限块长不改变前向语义。
+**读法**：delta 写在覆盖召回上有真实增益（+12–16% vs soft，3/3 复现），代价是 fp32 数值更脆
+（需限块长）与对种子更敏感（MQAR seed 7 崩溃）。通用语言建模上两者无显著差异。
+
+**(6) delta 写的训练步代价与解码代价**（`experiments/_assoc_ab_speed.py`，$d$=128、$L$=4，
+每格独立子进程、多轮交错）：
+
+| slots×m | B×T | soft ms/步 | delta ms/步 | delta/soft |
+|---|---|---|---|---|
+| 32×16 | 8×512 | 1671.8 / 1625.9 / 1624.4 | 1488.3 / 1446.6 / 1372.5 | **0.89 / 0.89 / 0.84** |
+| 64×32 | 8×256 | 1546.7 / 1610.0 | 1003.0 / 938.2 | **0.65 / 0.58** |
+| 128×64 | 4×256 | 2347.5 / 2304.0 / 2385.7 | 1198.1 / 1287.1 / 1489.3 | **0.51 / 0.56 / 0.62** |
+
+**分块 delta 写比软写更快，且差距随 slots×m 增大**（3/3、2/2、3/3 轮一致）。归因在算子级
+（B8/T512、slots 32×m 16、单线程，`AssocMemory.forward` 计时）：软写把外积物化成
+$(B,T,\text{slots}\cdot m)$ 张量交给 `logspace_scan`，其 `log`/`cumsum`/`exp` 都跑在 512 宽上
+——仅 `cumsum` 一项就 13.05 ms，占软写 34.27 ms 的 38%；delta 写把状态留在 $(\text{slots},m)$，
+逐元素工作降到 32 宽与 16 宽，块内只多解一个 $C\times C$ 三角系统（$C\le32$）。
+同一算子级对照：软写 scan 34.27 ms vs delta scan 21.32 ms（0.62×）。
+参数增量极小：delta 只多一个 `W_b`（dim+1），在 small 量级栈上是 **+516 参数（+0.034%）**
+（1,538,840 vs 1,538,324）。
+
+**解码代价**（B=1、单步、slots 32×m 16，交错 4 轮）：soft 9.006 / 9.717 / 11.559 / 9.104 ms，
+delta 8.172 / 8.335 / 7.503 / 9.912 ms（3/4 偏向 delta）。步进路径逐 token 求值，两者差异
+落在轮次波动内 ⇒ 解码读作**持平**，不作更快结论。
+
+**边界观察（既有行为，非本次改动引入）**：`assoc_slots=128, assoc_m=64` 配 B=8/T=512 训练会
+**使解释器段错误**；同一崩溃在 HEAD 树的 `git archive` 干净副本上同样复现。上面用到的
+32×16 与 64×32 配置不受影响，B=4/T=512 配 128×64 也通过。
+
+### 26.8 复现
 
 ```sh
 python -X utf8 experiments/_assoc_layers.py                      # §26.1 按层成本
@@ -3538,7 +3685,156 @@ python -X utf8 experiments/_converge_compare.py --tag assoc2_small_zh --assoc --
 python -X utf8 experiments/_converge_compare.py --tag tf_small_zh --arch transformer
 python -X utf8 train/evaluate.py --ckpt runs/<tag>.pt --gen --out runs/<tag>_eval.json
 python -X utf8 experiments/_gpu_compare.py                       # §26.6 (需 GPU 环境变量)
+# §26.7 写规则与写 key 对齐
+python -X utf8 experiments/_chunk_delta.py                       # 分块 delta vs 逐步 (fp64)
+python -X utf8 experiments/_assoc_overwrite.py                   # 软写 vs delta 写覆盖
+python -X utf8 experiments/_assoc_ab.py overwrite 800 1234       # 覆盖召回 A/B (3 种子)
+python -X utf8 experiments/_assoc_ab.py mqar      800 1234       # MQAR A/B
+python -X utf8 experiments/_assoc_ab.py ppl       600 1234       # 真实语料 ppl A/B
+python -X utf8 experiments/_assoc_ab_speed.py delta_scalar 512 32 16 12  # §26.9 写规则耗时
+python -X utf8 experiments/_decay_reduce.py                      # §26.9 归约方向的条件数
+python -X utf8 experiments/_chunk_bounds.py                      # §26.9(7)(8) 块长边界与守卫
 ```
+
+### 26.9 衰减归约的数值缺陷：`amin` 标量坍缩与标量衰减头
+
+§26.7 的 delta 写在一处实现上留了坑：分块形式只接受**标量**衰减，
+而逐通道衰减头 `W_g` 产出 $(B,T,m)$，于是每步都做一次 `amin(dim=-1)` 把它压成 $(B,T)$。
+这一行归约同时造成三个后果。
+
+**(1) 归约方向的数值代价**（`experiments/_decay_reduce.py`，$d$=128、$B$=8、$T$=256、
+slots 32×m 16）：
+
+| 归约 | 块长 32 的 $1/\prod d$ 峰值 | 块长 64 的峰值 |
+|---|---|---|
+| `amin`（取最快遗忘通道） | 3.15e8 | **9.92e16** |
+| `amax`（取最慢遗忘通道） | 1.34 | **1.78** |
+
+块内要算 $1/\prod_{i\le t} d_i$，量级 $\sim d_{\min}^{-L}$。`amin` 取组内**最小**保持率
+（即遗忘最快的那个通道），把这一个分母拉到最小、条件数拉到最大：块长 64 时 9.92e16，
+离 fp32 的 3.4e38 只剩 21 dB。改用 `amax` 后同块长条件数 **1.78**。
+
+**(2) 参数浪费**：`W_g` 是 `dim→m`（$m$=16，2048 参数/层），产出 16 个通道的衰减，
+归约后只用其中 1 个（`amin` 结果），**15/16 的输出直接丢弃**。
+
+**(3) 崩溃与种子强相关**：`amin` 的采到通道依赖数据，训练中会切换通道；切换点附近
+反向梯度不连续，表现为同一配置下个别种子（MQAR seed 7）掉到 0.014（低于随机）。
+
+**修复：`assoc_decay="scalar"`。** 分块形式本来就要求标量衰减，那就直接**输出标量**——
+新增 `W_gd(dim→2)`，一次线性同时给（保持率 $p$、写强度 $\beta$），不做归约、不建逐通道头。
+关键是 $p$ 必须走与逐通道头**同一条 H 参数化**：
+
+$$\delta = \frac{1}{h_{\max}} + \left(\frac{1}{h_{\min}} - \frac{1}{h_{\max}}\right)\sigma(g),
+\quad p = 1 - \delta \;\ge\; 1 - \frac{1}{h_{\min}}$$
+
+（$h_{\min}$=2 时 $p\ge0.5$）。若用裸 $\sigma$ 让 $p$ 自由学，$p$ 能落到 0.01，
+$1/\prod p$ 立刻爆量——这正是第一版实现把崩溃从 seed 7 挪到 seed 2024 的原因。
+参数化对齐后 $p$ 有硬下界，块长无需保守封顶。
+
+**(4) 三项实测对照**（$d$=128、4 层、3 种子，同 harness）：
+
+覆盖召回（800 步，chance 1/32=0.0312）：
+
+| 规则 | seed 1234 | seed 7 | seed 2024 | 均值 |
+|---|---|---|---|---|
+| soft | 0.8078 | 0.8953 | 0.9016 | 0.8682 |
+| delta+`amin` | 0.9187 | 0.9328 | 0.9203 | 0.9239 |
+| **delta+scalar** | **0.9203** | **0.9328** | **0.9234** | **0.9255** |
+
+MQAR（800 步）：
+
+| 规则 | seed 1234 | seed 7 | seed 2024 | 均值 |
+|---|---|---|---|---|
+| soft | 0.9359 | 0.9500 | 0.9594 | 0.9484 |
+| delta+`amin` | 0.9609 | **0.0141** | 0.9547 | 0.6432 |
+| **delta+scalar** | **0.9469** | **0.9484** | **0.9406** | **0.9453** |
+
+`amin` 的种子崩溃（seed 7 掉到 0.0141）在 scalar 下**消失**（0.9484）；
+scalar 三种子极差 0.0083，远小于 `amin` 的 0.9468。均值上 scalar 略低于 `amin` 的非崩种子
+（0.9453 vs 0.9578），是因为 scalar 把 $p$ 约束进了 $[0.5, 1)$——**用一点峰值换了不再崩**。
+
+真实语料 ppl（600 步、zh_ancient）：
+
+| 规则 | seed 1234 | seed 7 | seed 2024 | 均值 |
+|---|---|---|---|---|
+| soft | 332.05 | 324.03 | 354.97 | 337.02 |
+| delta+`amin` | 342.35 | 331.25 | 347.85 | 340.48 |
+| delta+scalar | **328.69** | 343.24 | **329.65** | **333.86** |
+
+scalar 均值比 soft 低 3.16（−0.94%），但 seed 7 方向相反（+19.2），组内极差
+（soft 30.94 / scalar 14.55）远大于均值差 ⇒ **与 §26.7(5) 同一读法：在种子噪声内，不作质量优势**。
+
+**(5) 参数与一致性**：
+
+| 配置 | 总参数 | assoc 层 | Δvs 关 |
+|---|---|---|---|
+| assoc 关 | 1,414,420 | 0 | 0 |
+| soft（原） | 1,538,324 | 58,368 | +123,904 |
+| delta+`amin` | 1,538,840 | 58,884 | +124,420 |
+| **delta+scalar** | **1,531,164** | 51,208 | +116,744 |
+
+scalar 比 soft **少 7,160 参数（−0.47%）**——去掉了被浪费的逐通道头。
+`reduce` 与 `scalar` 在 fp64 下 `forward` vs `step` 一致到 3.8e-15。
+
+**(6) 耗时**（slots 32×m 16、$d$=128、$L$=4，每格独立子进程、3 轮交错训练步 / 5 轮交错解码）：
+
+| 规则 | 训练步 ms（B8/T512） | 单步解码 ms（B=1） |
+|---|---|---|
+| soft | 1886.0 / 1841.0 / 1799.1 | 10.377 / 9.442 / 8.268 / 13.757 / 8.683 |
+| delta+`amin` | 1558.0 / 1596.4 / 1692.3 | 8.414 / 11.447 / 9.514 / 10.399 / 9.459 |
+| delta+scalar | 1633.9 / 1596.9 / 1546.6 | 8.120 / 9.150 / 9.884 / 9.015 / 7.973 |
+
+训练步 scalar 中位 1596.9 ms vs soft 1841.0 ms（**0.867×**），与 `amin` 同档（0.867×）。
+解码 scalar 中位 9.015 ms vs soft 9.442 ms（**0.955×**，逐轮配对 4/5 胜）——
+比 §26.7(6) 里 `amin` 的「持平」略好，但 soft 自身极差达 5.5 ms，读作**略优**。
+
+**结论**：`amin` 标量坍缩是 §26.7 三项弱点（参数、稳定性、种子敏感）的共同根因；
+标量衰减头一次修掉三者。代价是衰减上界被 $h$ 参数化约束，MQAR 峰值略低于 `amin` 的
+未崩种子。默认仍走 `reduce`，`scalar` 为可选。
+
+**(7) 块长 32 由稳定性定，不由速度定**（`chunk_delta_scan` 的 `chunk`）：
+
+`scalar` 模式把 $p$ 的结构下界锁在 0.5，$d_{\min}^{-L}$ 在 $L$=64 时才 1.84e19，
+看起来可以放开块长。两件事各测一遍，结论不同：
+
+**速度上各块长持平，测不出排名。** 每格独立子进程、逐轮交错（`experiments/_chunk_bounds.py chunk`；
+$B$=8、$T$=512、slots 32×$m$ 16、$p$=0.9988），合并两批共 22 个读数：
+
+| chunk | n | 中位 ms | 极差 | 相对 32 |
+|---|---|---|---|---|
+| **32** | 8 | 61.27 | 11.57 | 1.00× |
+| 48 | 5 | 69.27 | 14.09 | 1.13× |
+| 64 | 5 | 65.10 | **34.55** | 1.06× |
+| 128 | 4 | 66.97 | 13.12 | 1.09× |
+
+中位差（32 对 64 仅 3.8 ms）远小于 64 自身的极差（34.55 ms），逐轮配对结果也随批次翻转
+（一批 3/4 胜、另一批 2/4 平）。**在单进程内测块长排名会给出假差异**——同配置 64 曾录到
+50.67 与 85.22 两端。这里是本题材噪声的下限，不构成速度优势。
+
+**稳定性上 32 是硬边界。** $p$=0.5 时 $L$=64 的衰减梯度已非有限（前向仍 OK，$1/\prod d$
+让反向溢出），$L$=128 连前向都 NaN。逐块长扫出的最大稳定值是 $L$=62，但该点上文已说明
+速度与 32 无差别，没有收益。
+
+所以 `cap=32` 由稳定性决定：它落在稳定区内且速度不劣。这个 cap 曾被当作「保守妥协」，
+其实是必需条件。
+
+**(8) 守卫的 headroom 曾比实测安全水位宽 30 个二进制位**：
+
+块长的解析守卫按 $\bar d^{-L}\le 2^{\text{headroom}}$ 反解，原取 headroom=80。实测临界在
+$2^{57}$–$2^{62}$ 之间（下表「最大安全 $L$」由逐块长扫出）：
+
+| $p$ | 最大安全 $L$ | 对应 $2^{\log_2(1/\bar d^L)}$ |
+|---|---|---|
+| 0.3 | 36 | 62.5 |
+| 0.4 | 46 | 60.8 |
+| 0.5 | 62 | 62.0 |
+| 0.6 | 78 | 57.5 |
+| 0.7 | 78 | 40.1 |
+
+headroom=80 时守卫对 $p$=0.1/0.2 返回 $L$=24/34，实测两者都产出非有限衰减梯度。
+改为 headroom=50 后，$p\in[0.05,0.9]$ 全区间满足 $\bar d^{-L}\le 2^{50}$ 且实测稳定。
+生产路径 $p\ge 0.5$ 时 by_cond 恒 $\ge 50 > \text{cap}=32$，块长完全不变 —— 这项修正
+只影响直接以 $p<0.5$ 调用 `chunk_delta_scan` 的路径。
 
 ---
 
@@ -3784,6 +4080,21 @@ python -X utf8 experiments/_deltanet_int4_equiv.py           # §24.12(14) Delta
 python -X utf8 -m pytest tests/test_hgrn2_c.py -v
 python -X utf8 -m pytest tests/test_gla_c.py -v
 python -X utf8 -m pytest tests/test_deltanet_c.py -v
+```
+
+### 门控归因与关联记忆写规则（§24.14 / §26.7）
+
+```bash
+python -X utf8 experiments/_gate_originality.py jac               # §24.14(1) 算子级 Jacobian 谱范数
+python -X utf8 experiments/_gate_originality.py grad              # §24.14(2) 模型级嵌入梯度
+python -X utf8 experiments/_gate_originality.py train 600 1234    # §24.14(3) 门控形式质量 (3 种子)
+python -X utf8 experiments/_chunk_delta.py                        # §26.8 分块 delta vs 逐步
+python -X utf8 experiments/_assoc_overwrite.py                    # §26.8 软写 vs delta 写覆盖
+python -X utf8 experiments/_assoc_ab.py overwrite 800 1234        # §26.8 覆盖召回 A/B (3 种子)
+python -X utf8 experiments/_assoc_ab.py mqar      800 1234        # §26.8 MQAR A/B
+python -X utf8 experiments/_assoc_ab.py ppl       600 1234        # §26.8 真实语料 ppl A/B
+python -X utf8 experiments/_assoc_ab_speed.py soft 512 32 16 12   # §26.8 写规则耗时 (每格独立进程)
+python -X utf8 -m pytest tests/test_architecture.py -v
 ```
 
 > GGUF 权重与导出的 blob 体积大，由 `experiments/gguf/` 按需获取，不随仓库分发。
